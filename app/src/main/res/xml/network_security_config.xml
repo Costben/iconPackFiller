@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    允许明文 HTTP。
+
+    本应用的用户常在局域网里自建 OpenAI 兼容服务（如 http://192.168.31.179:3002），
+    明文是常见配置；逐一列出用户网段不现实，故全局放开 cleartext。
+    仅用于用户显式配置的 Base URL，应用自身不发起任何其他网络请求。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

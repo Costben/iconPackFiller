@@ -1,0 +1,5 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <path android:pathData="M7.333 2h-3.2l-2 4.333V17.8L0 22h5.2l2.028-4.2L7.333 2zm7.334 0h-5.2v20h5.2V2zM16.8 7.733H22V22h-5.2V7.733zM22 2h-5.2v4.133H22V2z"><gradient android:type="linear" android:startX="3.908" android:startY="3.736" android:endX="22.000" android:endY="20.264"><item android:offset="0.0000" android:color="#FFFEC13E"/><item android:offset="1.0000" android:color="#FFFF6933"/></gradient></path>
+</vector>
