@@ -29,8 +29,12 @@ class ApkFileIconPack private constructor(
         return source.openStream().use { it.readBytes() }
     }
 
-    /** 读取 assets/appfilter.xml 文本；不存在返回 null。 */
+    /**
+     * 读取 appfilter 文本。编译版资源优先，确保覆盖率计算与 Lawnchair 等启动器一致；
+     * assets 版是传统图标包的兼容回退。
+     */
     fun readAppFilterText(): String? {
+        readCompiledAppFilterText()?.let { return it }
         val source = module.getInputSource("assets/${InstalledIconPack.APPFILTER}")
             ?: module.getInputSource("assets/${InstalledIconPack.APPFILTER_NO_EXT}")
             ?: return null
@@ -91,7 +95,19 @@ class ApkFileIconPack private constructor(
         else -> 0
     }
 
+    private fun readCompiledAppFilterText(): String? {
+        val path = COMPILED_APPFILTER_PATHS.firstOrNull { module.getInputSource(it) != null } ?: return null
+        return runCatching {
+            module.loadResXmlDocument(path).serializeToXml()
+        }.getOrNull()
+    }
+
     companion object {
+        private val COMPILED_APPFILTER_PATHS = listOf(
+            "res/xml/appfilter.xml",
+            "res/raw/appfilter.xml",
+        )
+
         fun open(apkFile: File): ApkFileIconPack {
             val module = ApkModule.loadApkFile(apkFile)
             val table: TableBlock = module.tableBlock

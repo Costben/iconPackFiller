@@ -253,7 +253,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     when {
                         state.selectedPack != null ->
                             dev.artplus.iconpackfiller.generate.IconPackSource.open(context, state.selectedPack.packageName)
-                        apkFile != null -> dev.artplus.iconpackfiller.generate.IconPackSource.open(apkFile)
+                        apkFile != null -> dev.artplus.iconpackfiller.generate.IconPackSource.open(context, apkFile)
                         else -> null
                     }
                 } ?: error("无法打开图标包")
@@ -376,6 +376,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         rules = rules,
                         referencePairCount = settings.referencePairCount,
                         maxGenerationAttempts = 1 + settings.maxRetries,
+                        concurrency = config.concurrency,
                         callLimit = settings.callLimit.takeIf { it > 0 },
                         selectedTargets = selection,
                         referenceOverride = referenceOverride,
@@ -386,6 +387,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         rules = rules,
                         referencePairCount = settings.referencePairCount,
                         maxGenerationAttempts = 1 + settings.maxRetries,
+                        concurrency = config.concurrency,
                         callLimit = settings.callLimit.takeIf { it > 0 },
                         selectedTargets = selection,
                         referenceOverride = referenceOverride,
@@ -785,7 +787,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (state.selectedApkUri != null) {
             val cached = File(context.cacheDir, "source-iconpack.apk")
-            if (cached.exists()) IconPackSource.open(cached)?.let { return it }
+            if (cached.exists()) IconPackSource.open(context, cached)?.let { return it }
         }
         val fallback = state.packs.firstOrNull()
             ?: IconPackFinder.find(context).firstOrNull()
@@ -1047,7 +1049,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val cached = File(context.cacheDir, "source-iconpack.apk")
         if (!cached.exists()) return null
-        val opened = IconPackSource.open(cached) ?: return null
+        val opened = IconPackSource.open(context, cached) ?: return null
         if (record.packPackage.isEmpty() || opened.packageName == record.packPackage) return opened
         opened.close()
         return null

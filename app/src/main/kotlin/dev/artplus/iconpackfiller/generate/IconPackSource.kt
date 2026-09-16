@@ -3,7 +3,9 @@ package dev.artplus.iconpackfiller.generate
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import androidx.core.content.pm.PackageInfoCompat
 import dev.artplus.iconpackfiller.pack.ApkFileIconPack
+import dev.artplus.iconpackfiller.pack.ApkDrawableRenderer
 import dev.artplus.iconpackfiller.pack.AppFilterDocument
 import dev.artplus.iconpackfiller.pack.AppFilterParser
 import dev.artplus.iconpackfiller.pack.InstalledIconPack
@@ -34,12 +36,22 @@ sealed interface IconPackSource : AutoCloseable {
                 pack = pack,
                 document = document,
                 availableDrawables = drawables,
-                versionCode = info?.longVersionCode?.toInt() ?: 0,
+                versionCode = info?.let {
+                    PackageInfoCompat.getLongVersionCode(it)
+                        .coerceIn(0L, Int.MAX_VALUE.toLong())
+                        .toInt()
+                } ?: 0,
             )
         }
 
-        fun open(apkFile: File): IconPackSource? {
-            val pack = ApkFileIconPack.open(apkFile)
+        /** 本地 APK 的纯读取入口，适用于 JVM 元数据测试和位图资源。 */
+        fun open(apkFile: File): IconPackSource? = openLocal(apkFile, null)
+
+        /** 本地 APK 的 Android 入口，额外支持 vector/adaptive/XML drawable 栅格化。 */
+        fun open(context: Context, apkFile: File): IconPackSource? = openLocal(apkFile, context)
+
+        private fun openLocal(apkFile: File, context: Context?): IconPackSource? {
+            val pack = runCatching { ApkFileIconPack.open(apkFile) }.getOrNull() ?: return null
             val text = pack.readAppFilterText()
                 ?: run { pack.close(); return null }
             val document = runCatching {
@@ -47,8 +59,12 @@ sealed interface IconPackSource : AutoCloseable {
             }.getOrElse { pack.close(); return null }
             val drawables = document.items.map { it.drawableName }.filter { it in pack.drawables }.toSet()
             val (pkg, versionCode) = readManifestInfo(apkFile)
+            val renderer = context?.let {
+                runCatching { ApkDrawableRenderer(it, apkFile, pkg) }.getOrNull()
+            }
             return ApkSource(
                 pack = pack,
+                renderer = renderer,
                 apkFile = apkFile,
                 document = document,
                 availableDrawables = drawables,
@@ -80,6 +96,7 @@ private class InstalledSource(
 
 private class ApkSource(
     private val pack: ApkFileIconPack,
+    private val renderer: ApkDrawableRenderer?,
     private val apkFile: File,
     override val document: AppFilterDocument,
     override val availableDrawables: Set<String>,
@@ -88,9 +105,15 @@ private class ApkSource(
 ) : IconPackSource {
     override val sourceApk: File get() = apkFile
     override fun renderDrawable(drawableName: String): Bitmap? {
-        val bytes = pack.readDrawableBytes(drawableName) ?: return null
-        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val bytes = pack.readDrawableBytes(drawableName)
+        if (bytes != null) {
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
+        }
+        return renderer?.renderDrawable(drawableName)
     }
 
-    override fun close() = pack.close()
+    override fun close() {
+        renderer?.close()
+        pack.close()
+    }
 }

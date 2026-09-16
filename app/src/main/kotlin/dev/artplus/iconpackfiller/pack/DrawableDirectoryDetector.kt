@@ -54,7 +54,7 @@ object DrawableDirectoryDetector {
                     if (samples.size < maxSamplesPerDirectory && entry.size > 24) {
                         runCatching {
                             zip.getInputStream(entry).use { stream ->
-                                pngPixelSize(stream.readNBytes(24))
+                                pngPixelSize(stream.readAtMost(PNG_HEADER_SIZE))
                             }
                         }.getOrNull()?.let { samples.add(it) }
                     }
@@ -107,10 +107,25 @@ object DrawableDirectoryDetector {
             ((bytes[offset + 2].toInt() and 0xFF) shl 8) or
             (bytes[offset + 3].toInt() and 0xFF)
 
+    /** API 26 兼容的 InputStream 前缀读取；EOF 时返回实际读取字节。 */
+    private fun java.io.InputStream.readAtMost(count: Int): ByteArray {
+        val bytes = ByteArray(count)
+        var offset = 0
+        while (offset < count) {
+            val read = read(bytes, offset, count - offset)
+            if (read < 0) break
+            if (read == 0) continue
+            offset += read
+        }
+        return if (offset == count) bytes else bytes.copyOf(offset)
+    }
+
     private fun fallback() = Convention(
         directory = "res/$FALLBACK_DIRECTORY",
         density = FALLBACK_DENSITY,
         pixelSize = null,
         sampleCount = 0,
     )
+
+    private const val PNG_HEADER_SIZE = 24
 }

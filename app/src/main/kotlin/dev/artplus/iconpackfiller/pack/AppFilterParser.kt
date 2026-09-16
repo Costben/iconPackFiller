@@ -28,7 +28,11 @@ object AppFilterParser {
     fun parse(input: InputStream): AppFilterDocument {
         val parser = XmlPullParserFactory.newInstance().newPullParser()
         parser.setInput(input, null)
+        return parse(parser)
+    }
 
+    /** 复用 Android 的 XmlResourceParser，支持编译后的 res/xml appfilter。 */
+    fun parse(parser: XmlPullParser): AppFilterDocument {
         val items = ArrayList<AppFilterItem>()
         var iconback = emptyList<String>()
         var iconmask = emptyList<String>()

@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ResolveInfo
+import androidx.core.content.pm.PackageInfoCompat
 import dev.artplus.iconpackfiller.generate.AppIconLoader
 
 /**
@@ -43,7 +44,9 @@ object IconPackFinder {
                 InstalledIconPackInfo(
                     packageName = pkg,
                     label = runCatching { info.applicationInfo?.loadLabel(pm)?.toString() }.getOrNull() ?: pkg,
-                    versionCode = info.longVersionCode.toInt(),
+                    versionCode = PackageInfoCompat.getLongVersionCode(info)
+                        .coerceIn(0L, Int.MAX_VALUE.toLong())
+                        .toInt(),
                     icon = loadLauncherIcon(context, pkg),
                 ),
             )

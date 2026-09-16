@@ -267,4 +267,52 @@ class IconPackPackerTest {
         }
         output.delete()
     }
+
+    @Test
+    fun `drawable collision preserves original and remaps injection`() {
+        val first = File.createTempFile("packed-first-", ".apk")
+        val output = File.createTempFile("packed-collision-", ".apk")
+        try {
+            IconPackPacker().pack(
+                fixture,
+                first,
+                listOf(
+                    IconInjection(
+                        "ComponentInfo{com.example.first/com.example.first.Main}",
+                        "ap_gen_0",
+                        tinyPng(4),
+                    ),
+                ),
+            )
+            val original = ApkFileIconPack.open(first).use { pack ->
+                pack.readDrawableBytes("ap_gen_0") ?: error("首次注入资源缺失")
+            }
+
+            IconPackPacker().pack(
+                first,
+                output,
+                listOf(
+                    IconInjection(
+                        "ComponentInfo{com.example.second/com.example.second.Main}",
+                        "ap_gen_0",
+                        tinyPng(9),
+                    ),
+                ),
+            )
+
+            ApkFileIconPack.open(output).use { pack ->
+                assertTrue(original.contentEquals(pack.readDrawableBytes("ap_gen_0")), "原 ap_gen_0 被覆盖")
+                assertTrue("ap_gen_0_2" in pack.drawables, "冲突注入未改名：${pack.drawables.keys}")
+            }
+            ApkModule.loadApkFile(output).use { module ->
+                val text = module.getInputSource("assets/appfilter.xml")!!
+                    .openStream().use { it.readBytes().toString(StandardCharsets.UTF_8) }
+                assertTrue(text.contains("com.example.second"))
+                assertTrue(text.contains("drawable=\"ap_gen_0_2\""), "appfilter 未使用改名资源：$text")
+            }
+        } finally {
+            first.delete()
+            output.delete()
+        }
+    }
 }

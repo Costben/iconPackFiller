@@ -91,6 +91,9 @@ class IconPackPacker {
                 ?: error("APK 不含 resources.arsc：${sourceApk.name}")
             val packageBlock: PackageBlock = table.packages.next()
                 ?: error("resources.arsc 不含 package：${sourceApk.name}")
+            // 所有入口都在此分配 drawable 名，防止调用方传入 ap_gen_N 时覆盖原包资源。
+            // 同一批注入也纳入占用集，保证资源表和 appfilter 使用同一个唯一名称。
+            val effectiveInjections = allocateDrawableNames(packageBlock, injections)
 
             val originalPackage = packageBlock.name
             val newPackage = PackNaming.packageNameFor(originalPackage)
@@ -108,7 +111,7 @@ class IconPackPacker {
                 convention.density ?: DrawableDirectoryDetector.FALLBACK_DENSITY,
                 "drawable",
             )
-            for (injection in injections) {
+            for (injection in effectiveInjections) {
                 val resPath = convention.resPath(injection.drawableName)
                 val entry = typeBlock.getOrCreateEntry(injection.drawableName)
                 entry.setValueAsString(resPath)
@@ -124,7 +127,7 @@ class IconPackPacker {
                 runCatching { AppFilterParser.parse(it.byteInputStream(StandardCharsets.UTF_8)) }.getOrNull()
             }
             val existingComponents = AppFilterInjector.existingComponents(existingDoc)
-            val newItems = injections
+            val newItems = effectiveInjections
                 .filter { injection ->
                     val key = ComponentKey.parse(injection.component)?.flatten()?.lowercase()
                     key == null || key !in existingComponents
@@ -176,7 +179,7 @@ class IconPackPacker {
                 versionCode = PackNaming.versionCodeFor(originalVersionCode),
                 versionName = PackNaming.versionNameFor(originalVersionName),
                 label = PackNaming.labelFor(originalLabel),
-                injectedCount = injections.size,
+                injectedCount = effectiveInjections.size,
             )
         } finally {
             runCatching { module.close() }
@@ -186,6 +189,22 @@ class IconPackPacker {
     private fun readAppFilter(module: ApkModule): String? {
         val source = module.getInputSource("assets/appfilter.xml") ?: return null
         return source.openStream().use { it.readBytes().toString(StandardCharsets.UTF_8) }
+    }
+
+    private fun allocateDrawableNames(
+        packageBlock: PackageBlock,
+        injections: List<IconInjection>,
+    ): List<IconInjection> {
+        val occupied = HashSet<String>()
+        val existing = packageBlock.getResources("drawable")
+        while (existing.hasNext()) {
+            existing.next().name?.let(occupied::add)
+        }
+        return injections.map { injection ->
+            val drawableName = PackNaming.uniqueDrawableName(injection.drawableName, occupied)
+            occupied.add(drawableName)
+            if (drawableName == injection.drawableName) injection else injection.copy(drawableName = drawableName)
+        }
     }
 
     /**

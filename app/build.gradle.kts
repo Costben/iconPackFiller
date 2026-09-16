@@ -1,5 +1,20 @@
 import java.util.Properties
 
+val releaseKeystoreFile = file("release.jks")
+val releaseProperties = Properties().apply {
+    val propFile = rootProject.file("local.properties")
+    if (propFile.exists()) propFile.inputStream().use(::load)
+}
+val releaseStorePassword = System.getenv("KEYSTORE_PASSWORD")
+    ?: releaseProperties.getProperty("KEYSTORE_PASSWORD")
+val releaseKeyPassword = System.getenv("KEY_PASSWORD")
+    ?: releaseProperties.getProperty("KEY_PASSWORD")
+    ?: releaseStorePassword
+val releaseKeyAlias = System.getenv("KEY_ALIAS")
+    ?: releaseProperties.getProperty("KEY_ALIAS")
+    ?: "iconpackfiller"
+val releaseSigningReady = releaseKeystoreFile.isFile && !releaseStorePassword.isNullOrBlank()
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -21,37 +36,16 @@ android {
         targetSdk = 37
         versionCode = 1
         versionName = "0.1.0-m0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     signingConfigs {
         create("release") {
-            val keystoreFile = file("release.jks")
-            val localProperties = Properties().apply {
-                val propFile = rootProject.file("local.properties")
-                if (propFile.exists()) {
-                    propFile.inputStream().use { load(it) }
-                }
-            }
-            val storePass = System.getenv("KEYSTORE_PASSWORD")
-                ?: localProperties.getProperty("KEYSTORE_PASSWORD")
-            val keyPass = System.getenv("KEY_PASSWORD")
-                ?: localProperties.getProperty("KEY_PASSWORD")
-                ?: storePass
-            val resolvedKeyAlias = System.getenv("KEY_ALIAS")
-                ?: localProperties.getProperty("KEY_ALIAS")
-                ?: "iconpackfiller"
-
-            if (keystoreFile.exists() && !storePass.isNullOrBlank()) {
-                storeFile = keystoreFile
-                storePassword = storePass
-                keyAlias = resolvedKeyAlias
-                keyPassword = keyPass
-            } else {
-                val debug = getByName("debug")
-                storeFile = debug.storeFile
-                storePassword = debug.storePassword
-                keyAlias = debug.keyAlias
-                keyPassword = debug.keyPassword
+            if (releaseSigningReady) {
+                storeFile = releaseKeystoreFile
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
             }
         }
     }
@@ -60,7 +54,9 @@ android {
         debug {
         }
         release {
-            signingConfig = signingConfigs.getByName("release")
+            if (releaseSigningReady) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = false
             isDebuggable = false
         }
@@ -77,6 +73,17 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+gradle.taskGraph.whenReady {
+    val releaseRequested = allTasks.any { task ->
+        task.name == "assembleRelease" || task.name == "bundleRelease"
+    }
+    if (releaseRequested && !releaseSigningReady) {
+        throw GradleException(
+            "Release 签名材料缺失：需要 app/release.jks 和 KEYSTORE_PASSWORD（KEY_PASSWORD/KEY_ALIAS 可选）",
+        )
     }
 }
 
@@ -114,4 +121,6 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.4.10")
     testImplementation("org.json:json:20240303")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test:runner:1.6.2")
 }

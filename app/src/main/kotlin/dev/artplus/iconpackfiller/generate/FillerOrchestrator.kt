@@ -12,7 +12,12 @@ import dev.artplus.iconpackfiller.pack.IconPackPacker
 import dev.artplus.iconpackfiller.pack.PackNaming
 import dev.artplus.iconpackfiller.provider.ImageProvider
 import dev.artplus.iconpackfiller.reference.ReferencePair
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 端到端编排：扫描 → 覆盖率 → 参考对 → 生成 → 打包 → 签名。
@@ -32,9 +37,6 @@ class FillerOrchestrator(
     },
 ) {
 
-    /** 调试开关：导出每次请求的拼接图。正常使用保持 false。 */
-    private val sheetDumpEnabled = true
-
     /**
      * 输入：图标包来源（已安装包名 或 本地 APK 文件）+ 规则 + 参数。
      */
@@ -44,7 +46,11 @@ class FillerOrchestrator(
         val rules: CoverageRules = CoverageRules.DEFAULT,
         val referencePairCount: Int = 2,
         val maxGenerationAttempts: Int = 3,
+        /** 同时在飞的 provider 请求上限；设置页限制为 1..4。 */
+        val concurrency: Int = 1,
         val callLimit: Int? = null,
+        /** 仅开发诊断时落盘 ContactSheet，默认不写缓存。 */
+        val debugArtifacts: Boolean = false,
         /**
          * 仅生成这些目标（`package/activity` 稳定 key）；null 表示报告内全部。
          *
@@ -69,6 +75,7 @@ class FillerOrchestrator(
             require((installedPackage == null) != (apkFile == null)) {
                 "必须且只能指定 installedPackage 或 apkFile 之一"
             }
+            require(concurrency >= 1) { "并发数至少为 1" }
         }
     }
 
@@ -158,87 +165,128 @@ class FillerOrchestrator(
 
             // 3) 生成
             onProgress(Progress.GenerationStarted(plans.size))
-            val generated = ArrayList<GeneratedIcon>()
-            var failed = 0
-            var limitReached = false
             val total = plans.size
             // 预算按真实 API 调用计（含重试），避免重试把成本放大 maxAttempts 倍
             val budget = GenerationBudget(input.callLimit)
             // 生成模型只给 1024/1254 大图；缩到原包尺寸，避免启动器二次缩放发虚
             val convention = DrawableDirectoryDetector.detect(pack.sourceApk)
             val attempts = java.util.Collections.synchronizedList(arrayListOf<GenerationAttempt>())
+            val attemptLock = Any()
+            val resourceMutex = Mutex()
+            val progressLock = Any()
+            val results = arrayOfNulls<GeneratedIcon>(total)
+            val done = AtomicInteger(0)
+            val succeeded = AtomicInteger(0)
+            val failed = AtomicInteger(0)
+            val limitReached = AtomicBoolean(false)
             val pipeline = IconGenerationPipeline(
                 provider = provider,
                 maxAttempts = input.maxGenerationAttempts,
                 budget = budget,
                 outputSize = convention.pixelSize,
                 requestTransparentBackground = input.requestTransparentBackground,
-                // 调试开关：把发给模型的拼接图落盘到 cache/sheet-dump，供人工核对
-                sheetDumpDir = File(context.cacheDir, "sheet-dump").takeIf { sheetDumpEnabled },
+                sheetDumpDir = prepareSheetDumpDir(input.debugArtifacts),
                 provenance = provenance,
                 onAttempt = { attempt ->
-                    attempts.add(attempt)
-                    onAttempt?.invoke(attempt)
+                    // 批次记录可能落盘，串行化回调以防并发写同一记录文件。
+                    synchronized(attemptLock) {
+                        attempts.add(attempt)
+                        onAttempt?.invoke(attempt)
+                    }
                 },
             )
             onDiagnostic(
                 "包内图标约定：${convention.directory}" +
                     "（尺寸 ${convention.pixelSize ?: "未知"}，采样 ${convention.sampleCount}）",
             )
-            for ((index, plan) in plans.withIndex()) {
-                if (shouldCancel()) break
-                if (!budget.hasRemaining()) {
-                    limitReached = true
-                    onDiagnostic("达到调用上限（${input.callLimit}），剩余 ${total - index} 个应用跳过")
-                    break
-                }
-                val targetIcon = AppIconLoader.load(context, plan.target.packageName, plan.target.activityName)
-                val targetPair = targetPairs[plan.target.packageName]
-                if (targetIcon == null || targetPair == null) {
-                    failed++
-                    onDiagnostic("${plan.target.packageName}: 目标图标加载失败")
-                    onProgress(Progress.GenerationProgress(index + 1, total, generated.size, failed))
-                    continue
-                }
-                try {
-                    generated.add(
-                        pipeline.generate(
-                            targetIcon = targetIcon,
-                            targetPair = targetPair,
-                            initialPlan = plan,
-                            referencePool = referencePool,
-                            loadReference = { reference ->
-                                ReferencePoolBuilder.loadReferenceBitmaps(context, pack, reference, onDiagnostic)
-                            },
-                        ),
+            val events = GenerationQueue(
+                concurrency = input.concurrency,
+                // 调用额度由 GenerationBudget 按真实 provider 调用原子扣减，不能按任务数限制。
+                callLimit = null,
+                onEvent = { event ->
+                    when (event) {
+                        is GenerationEvent.Succeeded -> synchronized(progressLock) {
+                            val completed = done.incrementAndGet()
+                            val successCount = succeeded.incrementAndGet()
+                            onProgress(Progress.GenerationProgress(completed, total, successCount, failed.get()))
+                        }
+                        is GenerationEvent.Failed,
+                        is GenerationEvent.Skipped -> synchronized(progressLock) {
+                            val completed = done.incrementAndGet()
+                            failed.incrementAndGet()
+                            onProgress(Progress.GenerationProgress(completed, total, succeeded.get(), failed.get()))
+                        }
+                        GenerationEvent.LimitReached -> limitReached.set(true)
+                        GenerationEvent.Cancelled,
+                        is GenerationEvent.Started -> Unit
+                    }
+                },
+            ).run(
+                plans.mapIndexed { index, plan ->
+                    GenerationTask(
+                        key = "${plan.target.packageName}/${plan.target.activityName}",
+                        run = {
+                            if (shouldCancel()) throw CancellationException("用户取消")
+                            if (!budget.hasRemaining()) {
+                                limitReached.set(true)
+                                throw GenerationException("达到调用上限", retryable = false)
+                            }
+                            val targetIcon = AppIconLoader.load(
+                                context,
+                                plan.target.packageName,
+                                plan.target.activityName,
+                            )
+                            val targetPair = targetPairs[plan.target.packageName]
+                            if (targetIcon == null || targetPair == null) {
+                                targetIcon?.recycle()
+                                throw GenerationException("目标图标加载失败", retryable = false)
+                            }
+                            try {
+                                pipeline.generate(
+                                    targetIcon = targetIcon,
+                                    targetPair = targetPair,
+                                    initialPlan = plan,
+                                    referencePool = referencePool,
+                                    loadReference = { reference ->
+                                        // ARSCLib 模块在本地 APK 路径下共用，资源读取按次串行；
+                                        // ContactSheet 合成与 provider 请求仍可并发。
+                                        resourceMutex.withLock {
+                                            ReferencePoolBuilder.loadReferenceBitmaps(context, pack, reference, onDiagnostic)
+                                        }
+                                    },
+                                )
+                            } finally {
+                                targetIcon.recycle()
+                            }
+                        },
+                        encode = { icon -> icon.pngBytes },
+                        onResult = { icon, _ ->
+                            results[index] = icon
+                        },
                     )
-                } catch (e: GenerationException) {
-                    failed++
-                    onDiagnostic("${plan.target.packageName}: ${e.message?.take(300)}")
-                } catch (e: Exception) {
-                    failed++
-                    onDiagnostic("${plan.target.packageName}: ${e::class.simpleName} ${e.message?.take(300)}")
-                } finally {
-                    targetIcon.recycle()
-                }
-                onProgress(Progress.GenerationProgress(index + 1, total, generated.size, failed))
-            }
-            if (limitReached) {
+                },
+            )
+            val generated = results.filterNotNull()
+            if (limitReached.get() || events.any { it is GenerationEvent.LimitReached }) {
                 onProgress(Progress.LimitReached(budget.limitDescription()))
             }
-            onProgress(Progress.GenerationDone(generated.size, failed))
+            onProgress(Progress.GenerationDone(generated.size, failed.get()))
 
             // 4) 打包 + 签名
             onProgress(Progress.PackStarted(generated.size))
             val unsigned = File(workDir, "unsigned.apk")
             val signed = File(workDir, "signed.apk")
-            val injections = generated.mapIndexed { index, icon ->
-                IconInjection(
-                    // 带 activity：启动器按 ComponentName 匹配，包级写法会被跳过
-                    component = PackNaming.componentInfoFor(icon.packageName, icon.activityName),
-                    drawableName = PackNaming.drawableNameFor(index),
-                    pngBytes = icon.pngBytes,
-                )
+            // 用计划原始索引命名，而不是成功结果的紧凑索引：并发完成顺序、失败项和
+            // 重试都不会使后续 appfilter drawable 名发生漂移。
+            val injections = results.mapIndexedNotNull { planIndex, icon ->
+                icon?.let {
+                    IconInjection(
+                        // 带 activity：启动器按 ComponentName 匹配，包级写法会被跳过
+                        component = PackNaming.componentInfoFor(it.packageName, it.activityName),
+                        drawableName = PackNaming.drawableNameFor(planIndex),
+                        pngBytes = it.pngBytes,
+                    )
+                }
             }
             val packResult = packer.pack(
                 sourceApk = pack.sourceApk,
@@ -262,9 +310,20 @@ class FillerOrchestrator(
         }
     }
 
+    private fun prepareSheetDumpDir(enabled: Boolean): File? {
+        if (!enabled) return null
+        val dir = File(context.cacheDir, "sheet-dump")
+        dir.mkdirs()
+        val files = dir.listFiles().orEmpty().sortedBy { it.lastModified() }
+        files.take((files.size - MAX_SHEET_DUMPS).coerceAtLeast(0)).forEach { file ->
+            runCatching { file.delete() }
+        }
+        return dir
+    }
+
     private fun openSource(input: Input): IconPackSource? = when {
         input.installedPackage != null -> IconPackSource.open(context, input.installedPackage)
-        input.apkFile != null -> IconPackSource.open(input.apkFile)
+        input.apkFile != null -> IconPackSource.open(context, input.apkFile)
         else -> null
     }
 
@@ -282,4 +341,8 @@ class FillerOrchestrator(
         originalPackage = originalPackage,
         originalVersionCode = originalVersionCode,
     )
+
+    private companion object {
+        const val MAX_SHEET_DUMPS = 40
+    }
 }

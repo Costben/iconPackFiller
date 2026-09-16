@@ -13,6 +13,7 @@ import dev.artplus.iconpackfiller.reference.OutputValidator
 import dev.artplus.iconpackfiller.reference.PerceptualHash
 import dev.artplus.iconpackfiller.reference.PromptTemplate
 import dev.artplus.iconpackfiller.reference.ReferencePair
+import kotlinx.coroutines.CancellationException
 
 /**
  * 单图标生成结果。
@@ -96,7 +97,15 @@ class IconGenerationPipeline(
                 throw GenerationException("达到调用上限", retryable = false)
             }
             val loaded = plan.references.mapNotNull { reference ->
-                runCatching { loadReference(reference) }.getOrNull()?.let { reference to it }
+                val pair = try {
+                    loadReference(reference)
+                } catch (e: CancellationException) {
+                    // 取消必须穿透到 GenerationQueue，才能停止排队任务并跳过打包。
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+                pair?.let { reference to it }
             }
             if (loaded.isEmpty()) {
                 lastError = "没有可加载的参考图"

@@ -87,7 +87,7 @@ class OpenAIImagesProvider(
             contentType = "multipart/form-data; boundary=$boundary",
             apiKey = config.apiKey,
         )
-        return ImageResponseParser.parse(response) { http.getBytes(it, config.apiKey) }
+        return ImageResponseParser.parse(response) { http.getBytes(it) }
     }
 
     private suspend fun responsesEdit(request: ImageRequest): ByteArray {
@@ -127,7 +127,7 @@ class OpenAIImagesProvider(
             apiKey = config.apiKey,
             accept = "text/event-stream, application/json",
         )
-        return ImageResponseParser.parse(response) { http.getBytes(it, config.apiKey) }
+        return ImageResponseParser.parse(response) { http.getBytes(it) }
     }
 
     /**
@@ -170,7 +170,7 @@ class OpenAIImagesProvider(
                 "AI 响应没有图片数据" +
                     (ChatResponseParser.extractText(json)?.take(120)?.let { "（返回文本：$it）" } ?: ""),
             )
-        return ImageResponseParser.decodeReference(reference) { http.getBytes(it, config.apiKey) }
+        return ImageResponseParser.decodeReference(reference) { http.getBytes(it) }
             ?: throw ImageProviderException("AI 返回的图片无法解码")
     }
 

@@ -25,12 +25,29 @@ class InstalledIconPack(
     private val resources = context.packageManager.getResourcesForApplication(packageName)
 
     fun openAppFilter(): AppFilterDocument? {
+        openCompiledAppFilter()?.let { return it }
         val stream = runCatching {
             packageContext.assets.open(APPFILTER)
         }.getOrElse {
             runCatching { packageContext.assets.open(APPFILTER_NO_EXT) }.getOrNull()
         } ?: return null
         return stream.use { AppFilterParser.parse(it) }
+    }
+
+    private fun openCompiledAppFilter(): AppFilterDocument? {
+        for (type in COMPILED_APPFILTER_TYPES) {
+            val id = resources.getIdentifier(APPFILTER_NO_EXT, type, packageName)
+            if (id == 0) continue
+            return runCatching {
+                val parser = resources.getXml(id)
+                try {
+                    AppFilterParser.parse(parser)
+                } finally {
+                    parser.close()
+                }
+            }.getOrNull()
+        }
+        return null
     }
 
     /**
@@ -82,6 +99,7 @@ class InstalledIconPack(
         const val APPFILTER = "appfilter.xml"
         const val APPFILTER_NO_EXT = "appfilter"
         const val DEFAULT_SIZE = 512
+        private val COMPILED_APPFILTER_TYPES = listOf("xml", "raw")
 
         fun isIconPack(pm: PackageManager, packageName: String): Boolean {
             return runCatching {
@@ -92,6 +110,13 @@ class InstalledIconPack(
 
         private fun hasAppFilter(pm: PackageManager, packageName: String): Boolean {
             return runCatching {
+                val resources = pm.getResourcesForApplication(packageName)
+                if (COMPILED_APPFILTER_TYPES.any { type ->
+                        resources.getIdentifier(APPFILTER_NO_EXT, type, packageName) != 0
+                    }
+                ) {
+                    return@runCatching true
+                }
                 val appInfo = pm.getApplicationInfo(packageName, 0)
                 val assets = File(appInfo.sourceDir)
                 if (!assets.isFile) return@runCatching false
