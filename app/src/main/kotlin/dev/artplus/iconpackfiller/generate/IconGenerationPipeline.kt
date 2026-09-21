@@ -63,6 +63,14 @@ class IconGenerationPipeline(
     private val provenance: GenerationProvenance = GenerationProvenance(),
     /** 每次 provider 请求的结果回调（含未通过校验的），用于「结果预览」。 */
     private val onAttempt: ((GenerationAttempt) -> Unit)? = null,
+    /**
+     * 失败原因诊断回调。
+     *
+     * 参考图加载、provider 调用等失败不能静默吞掉——否则整单 0 图标时
+     * 用户既看不到 Attempt 也看不到原因（D-SNAP-1）。这里把原因上报给外层，
+     * 由外层写进 Generation 的 diagnostics / 失败行。
+     */
+    private val onDiagnostic: (String) -> Unit = {},
 ) {
 
     /**
@@ -96,19 +104,18 @@ class IconGenerationPipeline(
             if (!budget.hasRemaining()) {
                 throw GenerationException("达到调用上限", retryable = false)
             }
-            val loaded = plan.references.mapNotNull { reference ->
-                val pair = try {
-                    loadReference(reference)
-                } catch (e: CancellationException) {
-                    // 取消必须穿透到 GenerationQueue，才能停止排队任务并跳过打包。
-                    throw e
-                } catch (_: Exception) {
-                    null
+            var loaded = loadReferences(plan.references, loadReference)
+            // 已选参考全失效时用整池兜底：个别参考应用图标加载失败不应让整单归零。
+            if (loaded.isEmpty() && referencePool.isNotEmpty()) {
+                val fallback = referencePool.filter { it.packageName != plan.target.packageName }
+                if (fallback.isNotEmpty()) {
+                    onDiagnostic("目标 ${plan.target.packageName}：已选参考全部加载失败，改用参考池兜底（${fallback.size}）")
+                    loaded = loadReferences(fallback, loadReference)
                 }
-                pair?.let { reference to it }
             }
             if (loaded.isEmpty()) {
                 lastError = "没有可加载的参考图"
+                onDiagnostic("目标 ${plan.target.packageName}：没有可加载的参考图（候选 ${plan.references.size}）")
                 plan = nextPlan(plan, targetPair, referencePool)
                 continue
             }
@@ -154,9 +161,20 @@ class IconGenerationPipeline(
                 provider.generate(ImageRequest(prompt = prompt, images = listOf(sheet)))
             } catch (e: ImageProviderException) {
                 lastError = e.message ?: "provider 失败"
+                onDiagnostic(
+                    "provider 失败（${plan.target.packageName}，第 $attempt 次）：$lastError" +
+                        "（retryable=${e.retryable}）",
+                )
                 if (!e.retryable) throw GenerationException(lastError, retryable = false, cause = e)
                 plan = nextPlan(plan, targetPair, referencePool)
                 continue
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 非 ImageProviderException 的意外错误也要留痕，否则外层只看到 0 Attempt。
+                lastError = "${e::class.simpleName}: ${e.message ?: "provider 调用异常"}"
+                onDiagnostic("provider 调用异常（${plan.target.packageName}）：$lastError")
+                throw GenerationException(lastError, retryable = false, cause = e)
             } finally {
                 sheet.recycle()
             }
@@ -208,6 +226,7 @@ class IconGenerationPipeline(
             // 重试会再花一次付费调用，且实测重试很少能救回来（同提示词、同模型），
             // 因此只记录不重试；只有网络/5xx 这类可重试错误才换参考重试。
             val reason = (validation as OutputValidator.Result.Invalid).reason
+            onDiagnostic("校验未通过（${plan.target.packageName}，第 $attempt 次）：$reason")
             if (onAttempt != null) {
                 // downscale 会回收入参，因此只在需要记录时走一次
                 val preview = downscale(normalized)
@@ -269,6 +288,31 @@ class IconGenerationPipeline(
         val scaled = Bitmap.createScaledBitmap(normalized, target, target, true)
         if (scaled !== normalized) normalized.recycle()
         return scaled
+    }
+
+    /**
+     * 逐参考加载位图；单个参考失败只记录诊断，不吞掉整批。
+     *
+     * 取消必须穿透（[CancellationException] 原样抛出），其余异常折成该参考缺失。
+     */
+    private suspend fun loadReferences(
+        references: List<ReferencePair>,
+        loadReference: suspend (ReferencePair) -> Pair<Bitmap, Bitmap>?,
+    ): List<Pair<ReferencePair, Pair<Bitmap, Bitmap>>> {
+        val loaded = ArrayList<Pair<ReferencePair, Pair<Bitmap, Bitmap>>>(references.size)
+        for (reference in references) {
+            val pair = try {
+                loadReference(reference)
+            } catch (e: CancellationException) {
+                // 取消必须穿透到 GenerationQueue，才能停止排队任务并跳过打包。
+                throw e
+            } catch (e: Exception) {
+                onDiagnostic("参考 ${reference.packageName} 加载异常：${e.message ?: e::class.simpleName}")
+                null
+            }
+            if (pair != null) loaded.add(reference to pair)
+        }
+        return loaded
     }
 
     private fun nextPlan(

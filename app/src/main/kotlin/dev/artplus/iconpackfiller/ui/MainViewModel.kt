@@ -757,6 +757,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                     reason = attempt.reason,
                                 )
                             },
+                            // 0 Attempt 的失败（参考加载 / provider 异常）也要留原因
+                            failures = result.failures,
                         ),
                     )
                     refreshGeneration(gid)

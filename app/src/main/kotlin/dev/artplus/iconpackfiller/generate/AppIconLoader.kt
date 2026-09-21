@@ -50,8 +50,15 @@ object AppIconLoader {
     private fun Drawable.toBitmap(size: Int): Bitmap {
         if (this is BitmapDrawable && bitmap != null && !bitmap.isRecycled) {
             val source = bitmap
-            if (source.width == size && source.height == size) return source
-            return Bitmap.createScaledBitmap(source, size, size, true)
+            if (source.width == size && source.height == size) {
+                // 必须拷贝：LauncherApps/PackageManager 的 Drawable 可能复用同一缓存位图，
+                // 调用方（生成管线）会 recycle 拿到的位图，直接返回会毒化缓存，
+                // 之后同一图标再加载时报「recycled bitmap」并让参考图整批加载失败。
+                // 拷贝失败（回收竞态）则穿透到下面的重绘分支。
+                source.copy(Bitmap.Config.ARGB_8888, false)?.let { return it }
+            } else {
+                return Bitmap.createScaledBitmap(source, size, size, true)
+            }
         }
         val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)

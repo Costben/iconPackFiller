@@ -131,11 +131,27 @@ private class ApkSource(
     override val resources: List<PackResourceFile> get() = pack.resourceFiles
 
     override fun renderDrawable(drawableName: String): Bitmap? {
-        val bytes = pack.readDrawableBytes(drawableName)
+        // ARSCLib 读 zip 条目可能抛 IOException；快照路径若让它冒泡，
+        // 上层（参考图加载）会被静默吞掉并表现为「0 图标、无原因」。
+        // 这里折成 null 后退到平台 Resources 渲染，行为与已安装来源对齐。
+        val bytes = runCatching { pack.readDrawableBytes(drawableName) }.getOrNull()
         if (bytes != null) {
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            if (decoded != null) return decoded.normalizedForReference()
         }
         return renderer?.renderDrawable(drawableName)
+    }
+
+    /**
+     * 统一到与已安装来源（[InstalledIconPack.renderDrawable] 固定 [InstalledIconPack.DEFAULT_SIZE]）
+     * 相同的边长，避免同一图标包因来源不同而给模型不同分辨率的参考图。
+     */
+    private fun Bitmap.normalizedForReference(): Bitmap {
+        val size = InstalledIconPack.DEFAULT_SIZE
+        if (width == size && height == size) return this
+        val scaled = Bitmap.createScaledBitmap(this, size, size, true)
+        if (scaled !== this) recycle()
+        return scaled
     }
 
     override fun close() {

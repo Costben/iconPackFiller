@@ -75,6 +75,42 @@ class GenerationIconBuilderTest {
     }
 
     @Test
+    fun `build falls back to orchestrator failure reasons when there are no attempts`() {
+        val plans = listOf(
+            plan("com.a", "com.a.Main", "A"),
+            plan("com.b", "com.b.Main", "B"),
+        )
+
+        val icons = GenerationIconBuilder.build(
+            plans = plans,
+            acceptedKeys = emptySet(),
+            outcomes = emptyList(),
+            failures = mapOf("com.a" to "生成失败（3 次尝试）：没有可加载的参考图"),
+        )
+
+        assertEquals("生成失败（3 次尝试）：没有可加载的参考图", icons[0].reason)
+        assertNull(icons[1].reason)
+        assertTrue(icons.none { it.accepted })
+    }
+
+    @Test
+    fun `build prefers attempt reason over orchestrator failure reason`() {
+        val plans = listOf(plan("com.a", "com.a.Main", "A"))
+        val outcomes = listOf(
+            GenerationIconOutcome("com.a", "A", attempt = 1, accepted = false, reason = "校验未通过"),
+        )
+
+        val icon = GenerationIconBuilder.build(
+            plans = plans,
+            acceptedKeys = emptySet(),
+            outcomes = outcomes,
+            failures = mapOf("com.a" to "provider 失败"),
+        ).single()
+
+        assertEquals("校验未通过", icon.reason)
+    }
+
+    @Test
     fun `fromOutcomes merges attempts per package and keeps the accepted outcome`() {
         val outcomes = listOf(
             GenerationIconOutcome("com.a", "A", attempt = 1, accepted = false, reason = "校验未通过"),

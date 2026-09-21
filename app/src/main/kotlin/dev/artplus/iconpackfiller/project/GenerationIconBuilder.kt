@@ -18,11 +18,13 @@ object GenerationIconBuilder {
      * @param plans 本次生成的全部目标（顺序即 `ap_gen_<index>` 的序号）
      * @param acceptedKeys 产出并进入补全包的目标 key（`package/activity`）
      * @param outcomes 该次生成的全部请求结果（含被驳回的）
+     * @param failures 失败目标的原因（包名 -> 原因），用于「0 Attempt 但失败」时也能回看
      */
     fun build(
         plans: List<GenerationPlan>,
         acceptedKeys: Set<String>,
         outcomes: List<GenerationIconOutcome>,
+        failures: Map<String, String> = emptyMap(),
     ): List<GenerationIconSpec> {
         val reasonByPackage = lastReasonByPackage(outcomes)
         return plans.mapIndexed { index, plan ->
@@ -34,7 +36,11 @@ object GenerationIconBuilder {
                 label = app.label,
                 drawableName = if (accepted) PackNaming.drawableNameFor(index) else null,
                 accepted = accepted,
-                reason = if (accepted) null else reasonByPackage[app.packageName],
+                reason = if (accepted) {
+                    null
+                } else {
+                    reasonByPackage[app.packageName] ?: failures[app.packageName]
+                },
             )
         }
     }
