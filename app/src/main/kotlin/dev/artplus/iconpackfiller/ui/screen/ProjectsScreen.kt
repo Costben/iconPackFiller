@@ -10,8 +10,8 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
-import dev.artplus.iconpackfiller.batch.BatchRecord
-import dev.artplus.iconpackfiller.batch.BatchStatus
+import dev.artplus.iconpackfiller.project.SourceKind
+import dev.artplus.iconpackfiller.project.db.ProjectEntity
 import dev.artplus.iconpackfiller.ui.MainViewModel
 import dev.artplus.iconpackfiller.ui.UiState
 import dev.artplus.iconpackfiller.ui.component.MiuixScreen
@@ -25,22 +25,19 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
- * 批次列表：每次「执行任务」一条，可点进详情看进度与生成对比。
+ * 项目列表：导入或选定图标包即产生一条项目，可点进查看对应表与生成历史。
  */
 @Composable
-fun BatchesScreen(
+fun ProjectsScreen(
     state: UiState,
     viewModel: MainViewModel,
     onBack: () -> Unit,
 ) {
     val layoutDirection = LocalLayoutDirection.current
     MiuixScreen(
-        title = "历史任务",
+        title = "项目",
         navigationIcon = {
             IconButton(onClick = onBack) {
                 Icon(
@@ -56,7 +53,7 @@ fun BatchesScreen(
             }
         },
     ) {
-        if (state.batches.isEmpty()) {
+        if (state.projects.isEmpty()) {
             item(key = "empty") {
                 Card(
                     modifier = Modifier
@@ -64,24 +61,24 @@ fun BatchesScreen(
                         .padding(top = 12.dp),
                 ) {
                     BasicComponent(
-                        title = "还没有任务记录",
-                        summary = "每次生成都会自动记录，可随时回来查看进度和结果",
+                        title = "还没有项目",
+                        summary = "导入或选定一个图标包即自动创建项目",
                     )
                 }
             }
         } else {
             item(key = "title") {
-                SmallTitle(text = "共 ${state.batches.size} 个任务", modifier = Modifier.padding(top = 8.dp))
+                SmallTitle(text = "共 ${state.projects.size} 个项目", modifier = Modifier.padding(top = 8.dp))
             }
-            items(state.batches, key = { it.id }) { batch ->
-                BatchCard(batch) { viewModel.openBatch(batch.id) }
+            items(state.projects, key = { it.id }) { project ->
+                ProjectCard(project) { viewModel.openProject(project.id) }
             }
         }
     }
 }
 
 @Composable
-private fun BatchCard(batch: BatchRecord, onClick: () -> Unit) {
+private fun ProjectCard(project: ProjectEntity, onClick: () -> Unit) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -90,51 +87,22 @@ private fun BatchCard(batch: BatchRecord, onClick: () -> Unit) {
         showIndication = true,
     ) {
         BasicComponent(
-            title = batch.packLabel,
+            title = project.packLabel,
             summary = buildString {
-                append(statusText(batch.status))
+                append(project.packPackage)
                 append(" · ")
-                append(formatTime(batch.createdAt))
-                if (batch.plannedCount > 0) {
-                    append(" · 成功 ${batch.generatedCount}/失败 ${batch.failedCount}/共 ${batch.plannedCount}")
-                }
+                append(if (project.sourceKind == SourceKind.INSTALLED) "已安装" else "APK 文件")
+                append(" · ")
+                append(formatTime(project.updatedAt))
             },
             endActions = {
                 Text(
-                    text = when (batch.status) {
-                        BatchStatus.RUNNING -> "生成中"
-                        BatchStatus.COMPLETED -> "已完成"
-                        BatchStatus.CANCELLED -> "已取消"
-                        BatchStatus.INTERRUPTED -> "已中断"
-                        BatchStatus.FAILED -> "失败"
-                    },
-                    color = statusColor(batch.status),
+                    text = "打开",
+                    color = colorScheme.primary,
                     style = MiuixTheme.textStyles.body2,
                     modifier = Modifier.padding(end = 8.dp),
                 )
             },
         )
     }
-}
-
-@Composable
-private fun statusColor(status: BatchStatus) = when (status) {
-    BatchStatus.RUNNING -> colorScheme.primary
-    BatchStatus.COMPLETED -> colorScheme.primary
-    BatchStatus.CANCELLED, BatchStatus.INTERRUPTED -> colorScheme.onSurfaceVariantSummary
-    BatchStatus.FAILED -> colorScheme.error
-}
-
-private fun statusText(status: BatchStatus): String = when (status) {
-    BatchStatus.RUNNING -> "运行中"
-    BatchStatus.COMPLETED -> "完成"
-    BatchStatus.CANCELLED -> "用户取消"
-    BatchStatus.INTERRUPTED -> "进程中断"
-    BatchStatus.FAILED -> "执行失败"
-}
-
-internal fun formatTime(epochMillis: Long): String {
-    if (epochMillis <= 0) return "未知时间"
-    val format = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
-    return format.format(Date(epochMillis))
 }

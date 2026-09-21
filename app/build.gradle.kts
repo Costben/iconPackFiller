@@ -18,6 +18,13 @@ val releaseSigningReady = releaseKeystoreFile.isFile && !releaseStorePassword.is
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+}
+
+ksp {
+    // 导出 Room schema，迁移据此编写与校验（见 project/db/Migrations.kt）。
+    arg("room.schemaLocation", "$projectDir/schemas")
+    arg("room.generateKotlin", "true")
 }
 
 android {
@@ -116,6 +123,11 @@ dependencies {
     implementation("io.github.reandroid:ARSCLib:1.3.5")
     implementation("com.android.tools.build:apksig:9.3.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+
+    // 项目 / 生成历史的本地关系库（Requirements：Room/SQLite 关系表）
+    implementation("androidx.room:room-runtime:2.8.4")
+    implementation("androidx.room:room-ktx:2.8.4")
+    ksp("androidx.room:room-compiler:2.8.4")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.4.10")

@@ -55,7 +55,7 @@ fun DoneScreen(
     val layoutDirection = LocalLayoutDirection.current
     // 长按生成图 → 生成来源弹窗（与批次详情一致）
     val settings = remember { viewModel.settingsStore() }
-    var regenTarget by remember { mutableStateOf<dev.artplus.iconpackfiller.batch.AttemptRecord?>(null) }
+    var regenTarget by remember { mutableStateOf<dev.artplus.iconpackfiller.project.AttemptRecord?>(null) }
     val dialogSlots = remember(regenTarget) {
         if (regenTarget != null) settings.providerSlots.slots else emptyList()
     }
