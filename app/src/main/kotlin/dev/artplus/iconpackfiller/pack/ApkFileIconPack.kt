@@ -23,6 +23,9 @@ class ApkFileIconPack private constructor(
     /** drawable 名 -> 最佳匹配的 zip 内路径（优先高密度，其次默认 config）。 */
     val drawables: Map<String, String> by lazy { collectDrawables() }
 
+    /** 包内全部候选图标资源文件（`res/drawable*`、`res/mipmap*` 下的位图/XML）。 */
+    val resourceFiles: List<PackResourceFile> by lazy { collectResourceFiles() }
+
     fun readDrawableBytes(drawableName: String): ByteArray? {
         val path = drawables[drawableName] ?: return null
         val source: InputSource = module.getInputSource(path) ?: return null
@@ -84,16 +87,24 @@ class ApkFileIconPack private constructor(
         return best
     }
 
-    private fun densityRank(qualifiers: String): Int = when {
-        qualifiers.contains("anydpi") -> 7
-        qualifiers.contains("xxxhdpi") -> 6
-        qualifiers.contains("xxhdpi") -> 5
-        qualifiers.contains("xhdpi") -> 4
-        qualifiers.contains("hdpi") -> 3
-        qualifiers.contains("mdpi") -> 2
-        qualifiers.contains("ldpi") -> 1
-        else -> 0
-    }
+    private fun densityRank(qualifiers: String): Int = ResourceDensity.rank(qualifiers)
+
+    /**
+     * 遍历 zip 中央目录枚举图标资源文件，不解压内容，纯 JVM 可测。
+     */
+    private fun collectResourceFiles(): List<PackResourceFile> =
+        module.listInputSources()
+            .asSequence()
+            .map { it.name }
+            .filter { isIconResourcePath(it) }
+            .map { path ->
+                PackResourceFile(
+                    resPath = path,
+                    name = path.substringAfterLast('/').substringBeforeLast('.'),
+                )
+            }
+            .sortedBy { it.resPath }
+            .toList()
 
     private fun readCompiledAppFilterText(): String? {
         val path = COMPILED_APPFILTER_PATHS.firstOrNull { module.getInputSource(it) != null } ?: return null
@@ -107,6 +118,16 @@ class ApkFileIconPack private constructor(
             "res/xml/appfilter.xml",
             "res/raw/appfilter.xml",
         )
+
+        private val ICON_RESOURCE_EXTENSIONS = setOf("png", "webp", "jpg", "jpeg", "xml")
+
+        /** 只认 `res/drawable*` / `res/mipmap*` 下的图标资源。 */
+        fun isIconResourcePath(path: String): Boolean {
+            if (!path.startsWith("res/")) return false
+            val dir = path.substringBeforeLast('/', "").substringAfterLast('/')
+            if (!dir.startsWith("drawable") && !dir.startsWith("mipmap")) return false
+            return path.substringAfterLast('.', "").lowercase() in ICON_RESOURCE_EXTENSIONS
+        }
 
         fun open(apkFile: File): ApkFileIconPack {
             val module = ApkModule.loadApkFile(apkFile)

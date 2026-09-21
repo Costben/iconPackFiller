@@ -103,6 +103,13 @@ class FillerOrchestrator(
         val signedApk: File?,
         val originalPackage: String,
         val originalVersionCode: Int,
+        /**
+         * 失败目标的诊断（包名 -> 原因）。
+         *
+         * 用于「0 Attempt 但有失败」时把原因写进 GenerationIcon.reason；
+         * 否则用户只看到 0 图标、无原因（D-SNAP-1）。
+         */
+        val failures: Map<String, String> = emptyMap(),
     )
 
     /**
@@ -172,6 +179,7 @@ class FillerOrchestrator(
             val convention = DrawableDirectoryDetector.detect(pack.sourceApk)
             val attempts = java.util.Collections.synchronizedList(arrayListOf<GenerationAttempt>())
             val attemptLock = Any()
+            val failures = java.util.Collections.synchronizedMap(LinkedHashMap<String, String>())
             val resourceMutex = Mutex()
             val progressLock = Any()
             val results = arrayOfNulls<GeneratedIcon>(total)
@@ -194,6 +202,7 @@ class FillerOrchestrator(
                         onAttempt?.invoke(attempt)
                     }
                 },
+                onDiagnostic = onDiagnostic,
             )
             onDiagnostic(
                 "包内图标约定：${convention.directory}" +
@@ -210,11 +219,23 @@ class FillerOrchestrator(
                             val successCount = succeeded.incrementAndGet()
                             onProgress(Progress.GenerationProgress(completed, total, successCount, failed.get()))
                         }
-                        is GenerationEvent.Failed,
-                        is GenerationEvent.Skipped -> synchronized(progressLock) {
-                            val completed = done.incrementAndGet()
-                            failed.incrementAndGet()
-                            onProgress(Progress.GenerationProgress(completed, total, succeeded.get(), failed.get()))
+                        is GenerationEvent.Failed -> {
+                            failures[event.key.substringBefore('/')] = event.message
+                            onDiagnostic("生成失败 ${event.key}：${event.message}")
+                            synchronized(progressLock) {
+                                val completed = done.incrementAndGet()
+                                failed.incrementAndGet()
+                                onProgress(Progress.GenerationProgress(completed, total, succeeded.get(), failed.get()))
+                            }
+                        }
+                        is GenerationEvent.Skipped -> {
+                            failures[event.key.substringBefore('/')] = event.reason
+                            onDiagnostic("已跳过 ${event.key}：${event.reason}")
+                            synchronized(progressLock) {
+                                val completed = done.incrementAndGet()
+                                failed.incrementAndGet()
+                                onProgress(Progress.GenerationProgress(completed, total, succeeded.get(), failed.get()))
+                            }
                         }
                         GenerationEvent.LimitReached -> limitReached.set(true)
                         GenerationEvent.Cancelled,
@@ -271,6 +292,12 @@ class FillerOrchestrator(
                 onProgress(Progress.LimitReached(budget.limitDescription()))
             }
             onProgress(Progress.GenerationDone(generated.size, failed.get()))
+            if (generated.isEmpty() && total > 0) {
+                onDiagnostic(
+                    "本次生成 0 个图标（计划 $total，失败 ${failures.size}）：" +
+                        failures.entries.take(5).joinToString("；") { "${it.key}=${it.value.take(120)}" },
+                )
+            }
 
             // 4) 打包 + 签名
             onProgress(Progress.PackStarted(generated.size))
@@ -306,6 +333,7 @@ class FillerOrchestrator(
                 signedApk = signed,
                 originalPackage = pack.packageName,
                 originalVersionCode = pack.versionCode,
+                failures = failures.toMap(),
             )
         }
     }

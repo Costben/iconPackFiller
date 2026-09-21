@@ -4,9 +4,6 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import dev.artplus.iconpackfiller.batch.BatchRecord
-import dev.artplus.iconpackfiller.batch.BatchStatus
-import dev.artplus.iconpackfiller.batch.BatchStore
 import dev.artplus.iconpackfiller.coverage.AppScanner
 import dev.artplus.iconpackfiller.coverage.CoverageCalculator
 import dev.artplus.iconpackfiller.coverage.CoverageReport
@@ -25,6 +22,23 @@ import dev.artplus.iconpackfiller.reference.ContactSheetComposer
 import dev.artplus.iconpackfiller.reference.ReferencePair
 import dev.artplus.iconpackfiller.ui.component.SampledReferences
 import dev.artplus.iconpackfiller.pack.IconPackFinder
+import dev.artplus.iconpackfiller.project.AttemptRecord
+import dev.artplus.iconpackfiller.project.GenerationIconBuilder
+import dev.artplus.iconpackfiller.project.GenerationIconOutcome
+import dev.artplus.iconpackfiller.project.GenerationJsonCodec
+import dev.artplus.iconpackfiller.project.GenerationRecord
+import dev.artplus.iconpackfiller.project.GenerationSourceResolver
+import dev.artplus.iconpackfiller.project.GenerationStatus
+import dev.artplus.iconpackfiller.project.PackEntryBuilder
+import dev.artplus.iconpackfiller.project.ProjectPaths
+import dev.artplus.iconpackfiller.project.ProjectRepository
+import dev.artplus.iconpackfiller.project.SourceKind
+import dev.artplus.iconpackfiller.project.db.AppDatabase
+import dev.artplus.iconpackfiller.project.db.AttemptEntity
+import dev.artplus.iconpackfiller.project.db.GenerationEntity
+import dev.artplus.iconpackfiller.project.db.GenerationIconEntity
+import dev.artplus.iconpackfiller.project.db.GenerationIconMatch
+import dev.artplus.iconpackfiller.project.db.ProjectEntity
 import dev.artplus.iconpackfiller.provider.ApiProtocol
 import dev.artplus.iconpackfiller.provider.GatewayCatalog
 import dev.artplus.iconpackfiller.provider.GatewayModelList
@@ -39,15 +53,21 @@ import dev.artplus.iconpackfiller.settings.SettingsStore
 import dev.artplus.iconpackfiller.ui.component.ReferenceIconPair
 import dev.artplus.iconpackfiller.ui.navigation.Navigator
 import dev.artplus.iconpackfiller.ui.navigation.Route
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import java.io.File
 
 /**
  * 业务阶段（与导航解耦）：Progress 页标题/内容由它驱动。
@@ -60,12 +80,38 @@ private const val PREVIEW_ICON_SIZE = 128
 /** 正在重新请求的目标（对比行上的长按操作）；null 表示空闲。 */
 data class Regenerating(val packageName: String, val attempt: Int)
 
+/**
+ * 「生成详情」页的图标筛选三维度：包名 / 组件 / accepted。
+ * null 表示该维度不过滤。
+ */
+data class IconFilter(
+    val packageName: String? = null,
+    val activityName: String? = null,
+    val accepted: Boolean? = null,
+)
+
+/** 跨生成对比的目标（项目 + 包名 + 组件；activityName 为 null 表示整包）。 */
+data class CompareKey(
+    val projectId: String,
+    val packageName: String,
+    val activityName: String?,
+)
+
 data class UiState(
     val phase: Phase = Phase.IDLE,
     val packs: List<IconPackFinder.InstalledIconPackInfo> = emptyList(),
     val selectedPack: IconPackFinder.InstalledIconPackInfo? = null,
     val selectedApkUri: Uri? = null,
     val selectedApkName: String? = null,
+    /** 选定图标包后立即建出的项目 id；导入未完成/失败时为 null。 */
+    val selectedProjectId: String? = null,
+    /**
+     * 从项目目录内 `source.apk` 快照发起生成 / 重打包时指向的项目 id。
+     *
+     * 非空时覆盖活体选择（已安装包 / 导入 APK），生成结果挂回该项目（不新建）。
+     * 源包被卸载 / 更新 / 删除后仍可用。
+     */
+    val snapshotProjectId: String? = null,
     val report: CoverageReport? = null,
     /**
      * 「确认范围」页勾选的目标 key 集合（`package/activity`）。
@@ -96,14 +142,29 @@ data class UiState(
      * 本地校验判为不合格的那张未必是废图；也让「网关成功、界面失败」可直接对照。
      */
     val attempts: List<GenerationAttempt> = emptyList(),
-    /** 当前正在执行的批次 id（用于增量落盘）；未运行时为 null。 */
+    /** 当前正在执行的生成 id（用于增量落库）；未运行时为 null。 */
     val activeBatchId: String? = null,
     /** 正在重新请求的对比行；null 表示空闲。 */
     val regenerating: Regenerating? = null,
-    /** 历史批次列表（Pick 页展示入口；详情页用 [batchDetail]）。 */
-    val batches: List<BatchRecord> = emptyList(),
-    /** 当前查看的批次详情（Batches/BatchDetail/Done 页共用）。 */
-    val batchDetail: BatchRecord? = null,
+    /** 历史生成列表（Pick 页展示入口；详情页用 [batchDetail]）。 */
+    val batches: List<GenerationRecord> = emptyList(),
+    /** 当前查看的生成详情（列表/详情/Done 页共用）。 */
+    val batchDetail: GenerationRecord? = null,
+    // ---------- 项目 / 生成（Phase 6） ----------
+    /** 全部项目（导入即建项），更新时间倒序。 */
+    val projects: List<ProjectEntity> = emptyList(),
+    /** 当前打开项目的对应表条数（项目详情概览）。 */
+    val projectPackEntryCount: Int = 0,
+    /** 当前打开项目的生成历史，新在前。 */
+    val generations: List<GenerationEntity> = emptyList(),
+    /** 当前打开生成的全部图标行（未筛选，用于推导筛选候选项）。 */
+    val allGenerationIcons: List<GenerationIconEntity> = emptyList(),
+    /** 当前打开生成按 [iconFilter] 筛选后的图标行。 */
+    val generationIcons: List<GenerationIconEntity> = emptyList(),
+    /** 生成详情页当前的筛选条件。 */
+    val iconFilter: IconFilter = IconFilter(),
+    /** 当前对比目标跨生成的图标序列，新生成在前。 */
+    val compareMatches: List<GenerationIconMatch> = emptyList(),
 ) {
     val coveredCount: Int get() = report?.matched?.size ?: 0
     val uncoveredCount: Int get() = report?.unmatched?.size ?: 0
@@ -132,19 +193,93 @@ data class UiState(
         }
 }
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val settings = SettingsStore(application)
-    private val batches = BatchStore(application)
+
+    /** Room 项目库：一次进程一个实例（View 模型随 Activity 存活）。 */
+    private val database by lazy { AppDatabase.build(application) }
+    private val repository by lazy {
+        ProjectRepository(database.projectDao(), ProjectPaths(application))
+    }
+
+    /** 生成历史的内存投影缓存（详情页与文件访问需要 projectId）。 */
+    private val records = ConcurrentHashMap<String, GenerationRecord>()
+
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
+    /** 当前打开的项目 id（驱动生成历史 Flow）。 */
+    private val openedProjectId = MutableStateFlow<String?>(null)
+
+    /** 当前打开的生成 id（驱动图标 Flow）。 */
+    private val openedGenerationId = MutableStateFlow<String?>(null)
+
+    /** 生成详情页的筛选条件（驱动筛选后的图标 Flow）。 */
+    private val iconFilterFlow = MutableStateFlow(IconFilter())
+
+    /** 当前对比目标（驱动跨生成序列 Flow）。 */
+    private val compareKeyFlow = MutableStateFlow<CompareKey?>(null)
+
     init {
-        // 进程被杀后残留的 RUNNING 批次无法恢复，启动时标记为中断并刷新列表
+        // 进程被杀后残留的 RUNNING 生成无法恢复，启动时标记为中断并刷新列表
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { batches.markInterrupted() }
-            val list = withContext(Dispatchers.IO) { batches.list() }
-            _state.value = _state.value.copy(batches = list)
+            withContext(Dispatchers.IO) { repository.markRunningInterrupted() }
+            reloadRecords()
+        }
+        // 项目列表（导入即建项，响应式）
+        viewModelScope.launch {
+            repository.observeProjects().collect { projects ->
+                _state.value = _state.value.copy(projects = projects)
+            }
+        }
+        // 当前项目的生成历史
+        viewModelScope.launch {
+            openedProjectId.flatMapLatest { projectId ->
+                if (projectId == null) flowOf(emptyList()) else repository.observeGenerations(projectId)
+            }.collect { generations ->
+                _state.value = _state.value.copy(generations = generations)
+            }
+        }
+        // 当前生成的全部图标（未筛选）
+        viewModelScope.launch {
+            openedGenerationId.flatMapLatest { generationId ->
+                if (generationId == null) flowOf(emptyList()) else repository.observeIcons(generationId)
+            }.collect { icons ->
+                _state.value = _state.value.copy(allGenerationIcons = icons)
+            }
+        }
+        // 当前生成按筛选条件过滤后的图标
+        viewModelScope.launch {
+            combine(openedGenerationId, iconFilterFlow) { generationId, filter ->
+                generationId to filter
+            }.flatMapLatest { (generationId, filter) ->
+                if (generationId == null) {
+                    flowOf(emptyList())
+                } else {
+                    repository.observeIcons(
+                        generationId = generationId,
+                        packageName = filter.packageName,
+                        activityName = filter.activityName,
+                        accepted = filter.accepted,
+                    )
+                }
+            }.collect { icons ->
+                _state.value = _state.value.copy(generationIcons = icons)
+            }
+        }
+        // 同一目标跨 Generation 的图标序列
+        viewModelScope.launch {
+            compareKeyFlow.flatMapLatest { key ->
+                if (key == null) {
+                    flowOf(emptyList())
+                } else {
+                    repository.observeCompareTarget(key.projectId, key.packageName, key.activityName)
+                }
+            }.collect { matches ->
+                _state.value = _state.value.copy(compareMatches = matches)
+            }
         }
     }
 
@@ -152,10 +287,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val navigator = Navigator(Route.START)
 
     private var runJob: Job? = null
+
+    /** 「导入即建项目」的后台任务；换包时取消上一个。 */
+    private var importJob: Job? = null
+
     private var session: FillerOrchestrator.Session? = null
 
-    /** 最近一次运行对应的批次 id（Done 页实时追加重新请求结果用）。 */
-    private var sessionBatchId: String? = null
+    /** 最近一次运行对应的生成 id（Done 页实时追加重新请求结果用）。 */
+    private var sessionGenerationId: String? = null
 
     fun refreshPacks() {
         viewModelScope.launch {
@@ -170,8 +309,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selectedPack = pack,
             selectedApkUri = null,
             selectedApkName = null,
+            selectedProjectId = null,
+            snapshotProjectId = null,
             error = null,
         )
+        startProjectImport(_state.value)
     }
 
     fun selectApk(uri: Uri, name: String?) {
@@ -180,8 +322,61 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selectedApkUri = uri,
             selectedApkName = name,
             selectedPack = null,
+            selectedProjectId = null,
+            snapshotProjectId = null,
             error = null,
         )
+        startProjectImport(_state.value)
+    }
+
+    /**
+     * 「导入或选定图标包即建项目」：解析源元数据、复制快照并把对应表落库。
+     *
+     * 全程在 IO 线程执行，大包分批事务，不阻塞主线程；失败只记 [UiState.error]，
+     * 不阻断后续流程（run() 仍会兜底 ensureProject）。
+     */
+    private fun startProjectImport(state: UiState) {
+        if (state.selectedPack == null && state.selectedApkUri == null) return
+        importJob?.cancel()
+        importJob = viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    val context = getApplication<Application>()
+                    val apkFile = copyApkToCache(state.selectedApkUri)
+                    val source = when {
+                        state.selectedPack != null ->
+                            IconPackSource.open(context, state.selectedPack.packageName)
+                        apkFile != null -> IconPackSource.open(context, apkFile)
+                        else -> null
+                    } ?: return@withContext
+                    source.use { pack ->
+                        val entries = PackEntryBuilder.build(
+                            document = pack.document,
+                            resourcePath = { pack.resourcePath(it) },
+                            exists = { it in pack.availableDrawables },
+                        )
+                        val project = repository.importProject(
+                            sourceKind = if (state.selectedPack != null) {
+                                SourceKind.INSTALLED
+                            } else {
+                                SourceKind.APK_FILE
+                            },
+                            packLabel = state.selectedPack?.label ?: state.selectedApkName ?: "图标包",
+                            packPackage = pack.packageName,
+                            packVersionCode = pack.versionCode,
+                            packHash = sha256(pack.sourceApk),
+                            sourceApk = pack.sourceApk,
+                            entries = entries,
+                        )
+                        _state.value = _state.value.copy(selectedProjectId = project.id)
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.value = _state.value.copy(error = e.message ?: "建立项目失败")
+            }
+        }
     }
 
     fun settingsStore(): SettingsStore = settings
@@ -248,15 +443,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val context = getApplication<Application>()
-                val apkFile = withContext(Dispatchers.IO) { copyApkToCache(state.selectedApkUri) }
-                val source = withContext(Dispatchers.IO) {
-                    when {
-                        state.selectedPack != null ->
-                            dev.artplus.iconpackfiller.generate.IconPackSource.open(context, state.selectedPack.packageName)
-                        apkFile != null -> dev.artplus.iconpackfiller.generate.IconPackSource.open(context, apkFile)
-                        else -> null
-                    }
-                } ?: error("无法打开图标包")
+                val source = withContext(Dispatchers.IO) { openResolvedSource(context, state) }
+                    ?: error("无法打开图标包")
                 source.use { pack ->
                     val apps = withContext(Dispatchers.IO) {
                         dev.artplus.iconpackfiller.coverage.AppScanner(context).scan()
@@ -287,6 +475,64 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
+     * 从项目目录内的 `source.apk` 快照发起生成 / 重打包。
+     *
+     * 源包被卸载 / 更新 / 删除后快照仍可用；生成结果挂回同一 Project（不新建重复项目）。
+     * 复用与活体选择相同的 Review → run 流程，仅来源换成快照。
+     */
+    fun startGenerationFromProject(projectId: String) {
+        if (_state.value.running) return
+        if (repository.sourceApk(projectId) == null) {
+            _state.value = _state.value.copy(error = "项目源快照缺失，无法生成")
+            return
+        }
+        clearSession()
+        _state.value = _state.value.copy(
+            snapshotProjectId = projectId,
+            selectedPack = null,
+            selectedApkUri = null,
+            selectedApkName = null,
+            selectedProjectId = null,
+            error = null,
+        )
+        analyze()
+    }
+
+    /**
+     * 把 UI 状态解析为本次生成来源（项目快照 > 已安装包 > 导入 APK）。
+     *
+     * 快照路径读取项目目录内的 `source.apk`；文件缺失时自动回退到活体选择，
+     * 不因快照丢失而中断现有流程。
+     */
+    private suspend fun resolveSource(state: UiState): GenerationSourceResolver.Resolved? {
+        val snapshotProjectId = state.snapshotProjectId
+        val snapshotApk = snapshotProjectId?.let { repository.sourceApk(it) }
+        val snapshotLabel = snapshotProjectId?.let { pid ->
+            state.projects.firstOrNull { it.id == pid }?.packLabel
+        }
+        val apkFile = copyApkToCache(state.selectedApkUri)
+        return GenerationSourceResolver.resolve(
+            snapshotProjectId = snapshotProjectId,
+            snapshotApk = snapshotApk,
+            snapshotLabel = snapshotLabel,
+            installedPackage = state.selectedPack?.packageName,
+            installedLabel = state.selectedPack?.label,
+            apkFile = apkFile,
+            apkLabel = state.selectedApkName,
+        )
+    }
+
+    /** 按当前状态解析并打开图标包来源；返回 null 表示没有可用来源。 */
+    private suspend fun openResolvedSource(context: Application, state: UiState): IconPackSource? {
+        val resolved = resolveSource(state) ?: return null
+        return when {
+            resolved.installedPackage != null -> IconPackSource.open(context, resolved.installedPackage)
+            resolved.apkFile != null -> IconPackSource.open(context, resolved.apkFile)
+            else -> null
+        }
+    }
+
+    /**
      * 完整执行：生成 → 打包 → 签名。
      *
      * 成功后返回栈重置为 [Pick, Done]；中途取消/失败回到 Review。
@@ -313,90 +559,113 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         navigator.push(Route.Progress)
 
-        // 创建批次记录：一次「执行任务」= 一个批次，之后进度/结果都能从列表点回来
-        val packLabel = state.selectedPack?.label ?: state.selectedApkName ?: "图标包"
-        // 导入 APK 时先为空，跑完从解析出的包名回填（「重新生成」要靠它找图标包源）
-        var packPackage = state.selectedPack?.packageName ?: ""
-        val batchId = batches.newId()
-        sessionBatchId = batchId
-        val batchStartedAt = System.currentTimeMillis()
+        val startedAt = System.currentTimeMillis()
 
         _state.value = state.copy(
             phase = Phase.GENERATING,
             error = null,
             statusText = "准备…",
-            activeBatchId = batchId,
+            activeBatchId = null,
         )
 
         runJob = viewModelScope.launch {
             val scope = this
             val diagnostics = java.util.Collections.synchronizedList(arrayListOf<String>())
-            // 每条 attempt 完成即落盘：取消/崩溃也保得住已生成的图
-            val persistedAttempts = java.util.Collections.synchronizedList(arrayListOf<dev.artplus.iconpackfiller.batch.AttemptRecord>())
+            var projectId: String? = null
+            var generationId: String? = null
 
-            fun persistBatch(status: BatchStatus, planCount: Int, generated: Int, failed: Int, outputApk: String?, outputApkName: String?) {
-                val existing = batches.read(batchId)
-                val record = BatchRecord(
-                    id = batchId,
-                    packLabel = packLabel,
-                    packPackage = packPackage,
-                    createdAt = batchStartedAt,
-                    status = status,
-                    plannedCount = if (planCount > 0) planCount else existing?.plannedCount ?: 0,
-                    generatedCount = generated,
-                    failedCount = failed,
-                    outputApk = outputApk ?: existing?.outputApk,
-                    outputApkName = outputApkName ?: existing?.outputApkName,
-                    diagnostics = diagnostics.toList(),
-                    attempts = persistedAttempts.toList(),
-                )
-                batches.save(record)
-                // 批次进度同步给界面（列表/详情页实时看到）
-                _state.value = _state.value.copy(
-                    batches = batches.list(),
-                    batchDetail = batches.read(batchId),
-                )
-            }
-
-            // 先落一条 RUNNING，列表里立刻能看到这个批次
-            withContext(Dispatchers.IO) {
-                persistBatch(BatchStatus.RUNNING, planCount = 0, generated = 0, failed = 0, outputApk = null, outputApkName = null)
+            // 进度回调是非 suspend 的（编排器逐图标调用），落库走 runBlocking——
+            // 与旧实现「在 IO 线程同步写批次文件」同构，且在 IO 线程上不会阻塞主线程。
+            fun persistProgress(
+                status: GenerationStatus,
+                planCount: Int,
+                generated: Int,
+                failed: Int,
+            ) {
+                val pid = projectId ?: return
+                val gid = generationId ?: return
+                runBlocking {
+                    val existing = repository.generation(gid) ?: return@runBlocking
+                    repository.updateGeneration(
+                        existing.copy(
+                            status = status,
+                            plannedCount = if (planCount > 0) planCount else existing.plannedCount,
+                            generatedCount = generated,
+                            failedCount = failed,
+                            diagnosticsJson = GenerationJsonCodec.encodeDiagnostics(diagnostics.toList()),
+                        ),
+                    )
+                    refreshGeneration(gid)
+                }
             }
 
             try {
                 val context = getApplication<Application>()
                 val workDir = File(context.cacheDir, "filler-work").apply { mkdirs() }
-                val apkFile = withContext(Dispatchers.IO) { copyApkToCache(state.selectedApkUri) }
                 val rules = CoverageRules.DEFAULT.copy(excludeSystemApps = settings.excludeSystemApps)
                 // 确认范围页敲定的参考优先整批固定；没挑过则按目标配色自动选
                 val referenceOverride = state.batchReferences.takeIf { it.isNotEmpty() }
-                val input = when {
-                    state.selectedPack != null -> FillerOrchestrator.Input(
-                        installedPackage = state.selectedPack.packageName,
-                        rules = rules,
-                        referencePairCount = settings.referencePairCount,
-                        maxGenerationAttempts = 1 + settings.maxRetries,
-                        concurrency = config.concurrency,
-                        callLimit = settings.callLimit.takeIf { it > 0 },
-                        selectedTargets = selection,
-                        referenceOverride = referenceOverride,
-                        requestTransparentBackground = requestTransparent,
+                // 来源解析：项目快照优先（源包卸载/更新/删除后仍可重打包），否则活体选择
+                val resolved = resolveSource(state) ?: error("未选择图标包")
+                val input = FillerOrchestrator.Input(
+                    installedPackage = resolved.installedPackage,
+                    apkFile = resolved.apkFile,
+                    rules = rules,
+                    referencePairCount = settings.referencePairCount,
+                    maxGenerationAttempts = 1 + settings.maxRetries,
+                    concurrency = config.concurrency,
+                    callLimit = settings.callLimit.takeIf { it > 0 },
+                    selectedTargets = selection,
+                    referenceOverride = referenceOverride,
+                    requestTransparentBackground = requestTransparent,
+                )
+
+                // 1) 解析源元数据 → 建/复用项目（含源 APK 快照）
+                val meta = withContext(Dispatchers.IO) { openSourceMeta(context, resolved) }
+                    ?: error("无法打开图标包")
+                // 快照来源复用既有项目（不新建）；活体来源按元数据 ensure
+                val project = withContext(Dispatchers.IO) {
+                    repository.resolveProjectForRun(
+                        reuseProjectId = resolved.reuseProjectId,
+                        sourceKind = resolved.liveSourceKind ?: SourceKind.APK_FILE,
+                        packLabel = resolved.label,
+                        packPackage = meta.packageName,
+                        packVersionCode = meta.versionCode,
+                        packHash = meta.hash,
+                        sourceApk = meta.apkFile,
+                        now = startedAt,
                     )
-                    apkFile != null -> FillerOrchestrator.Input(
-                        apkFile = apkFile,
-                        rules = rules,
-                        referencePairCount = settings.referencePairCount,
-                        maxGenerationAttempts = 1 + settings.maxRetries,
-                        concurrency = config.concurrency,
-                        callLimit = settings.callLimit.takeIf { it > 0 },
-                        selectedTargets = selection,
-                        referenceOverride = referenceOverride,
-                        requestTransparentBackground = requestTransparent,
-                    )
-                    else -> error("未选择图标包")
-                }
-                val provider = ImageProviderFactory.create(config)
+                } ?: error("项目不存在")
+                projectId = project.id
+
+                // 2) 建一条 Generation（RUNNING），run 全程挂在它下面
                 val activeSlot = settings.activeSlot
+                val generation = withContext(Dispatchers.IO) {
+                    repository.createGeneration(
+                        projectId = project.id,
+                        status = GenerationStatus.RUNNING,
+                        model = activeSlot.model,
+                        slotId = activeSlot.id,
+                        slotName = activeSlot.name,
+                        paramsJson = GenerationJsonCodec.encodeParams(
+                            mapOf(
+                                "referencePairCount" to settings.referencePairCount,
+                                "maxAttempts" to (1 + settings.maxRetries),
+                                "concurrency" to config.concurrency,
+                                "callLimit" to settings.callLimit.takeIf { it > 0 },
+                                "transparent" to requestTransparent,
+                                "excludeSystemApps" to settings.excludeSystemApps,
+                            ),
+                        ),
+                        now = startedAt,
+                    ).also { repository.setActiveGeneration(project.id, it.id) }
+                }
+                generationId = generation.id
+                sessionGenerationId = generation.id
+                _state.value = _state.value.copy(activeBatchId = generation.id)
+                reloadRecords()
+
+                val provider = ImageProviderFactory.create(config)
                 val orchestrator = FillerOrchestrator(
                     context,
                     workDir,
@@ -408,7 +677,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     ),
                     onDiagnostic = { message ->
                         android.util.Log.w("IconPackFiller", message)
-                        // 失败原因要能回看：诊断同步进批次记录（截断防止 JSON 过大）
+                        // 失败原因要能回看：诊断同步进生成记录（截断防止 JSON 过大）
                         diagnostics.add(message.take(300))
                     },
                 )
@@ -418,56 +687,81 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         input = input,
                         onProgress = { progress ->
                             handleProgress(progress)
-                            // 进度增量落盘：切后台/被杀后回来也能看到真实进度
+                            // 进度增量落库：切后台/被杀后回来也能看到真实进度
                             when (progress) {
                                 is FillerOrchestrator.Progress.PlanDone ->
-                                    persistBatch(
-                                        BatchStatus.RUNNING,
+                                    persistProgress(
+                                        GenerationStatus.RUNNING,
                                         planCount = progress.planCount,
                                         generated = 0,
                                         failed = 0,
-                                        outputApk = null,
-                                        outputApkName = null,
                                     )
                                 is FillerOrchestrator.Progress.GenerationProgress ->
-                                    persistBatch(
-                                        BatchStatus.RUNNING,
+                                    persistProgress(
+                                        GenerationStatus.RUNNING,
                                         planCount = progress.total,
                                         generated = progress.succeeded,
                                         failed = progress.failed,
-                                        outputApk = null,
-                                        outputApkName = null,
                                     )
                                 else -> Unit
                             }
                         },
                         shouldCancel = { !scope.isActive },
                         onAttempt = { attempt ->
-                            val record = batches.persistAttempt(batchId, attempt)
-                            persistedAttempts.add(record)
-                            batches.read(batchId)?.let { current ->
-                                batches.save(current.copy(attempts = persistedAttempts.toList()))
+                            runBlocking {
+                                repository.persistAttempt(project.id, generation.id, attempt)
+                                refreshGeneration(generation.id)
                             }
                         },
                     )
                 }
                 session = result
-                if (packPackage.isEmpty()) packPackage = result.originalPackage
                 withContext(Dispatchers.IO) {
-                    persistBatch(
-                        status = BatchStatus.COMPLETED,
-                        planCount = result.plans.size,
-                        generated = result.generated.size,
-                        failed = result.plans.size - result.generated.size,
-                        outputApk = batches.persistApk(batchId, result.signedApk),
-                        // 导出时给用户看的文件名（不要暴露内部 signed.apk）
-                        outputApkName = result.signedApk?.let {
-                            dev.artplus.iconpackfiller.pack.SafExporter.fileNameFor(
-                                result.originalPackage,
-                                result.originalVersionCode,
-                            )
-                        },
+                    val pid = project.id
+                    val gid = generation.id
+                    val existing = repository.generation(gid) ?: return@withContext
+                    val outputApk = repository.persistApk(pid, gid, result.signedApk)
+                    repository.updateGeneration(
+                        existing.copy(
+                            status = GenerationStatus.COMPLETED,
+                            plannedCount = result.plans.size,
+                            generatedCount = result.generated.size,
+                            failedCount = result.plans.size - result.generated.size,
+                            outputPackageName = result.originalPackage,
+                            outputApkFile = outputApk ?: existing.outputApkFile,
+                            // 导出时给用户看的文件名（不要暴露内部 signed.apk）
+                            outputApkName = result.signedApk?.let {
+                                dev.artplus.iconpackfiller.pack.SafExporter.fileNameFor(
+                                    result.originalPackage,
+                                    result.originalVersionCode,
+                                )
+                            } ?: existing.outputApkName,
+                            diagnosticsJson = GenerationJsonCodec.encodeDiagnostics(diagnostics.toList()),
+                        ),
                     )
+                    // 目标与结果落 GenerationIcon：accepted/reason/label/drawableName
+                    val acceptedKeys = result.generated.mapTo(HashSet()) {
+                        TargetSelection.keyOf(it.packageName, it.activityName)
+                    }
+                    repository.persistGenerationIcons(
+                        gid,
+                        GenerationIconBuilder.build(
+                            plans = result.plans,
+                            acceptedKeys = acceptedKeys,
+                            outcomes = result.attempts.map { attempt ->
+                                GenerationIconOutcome(
+                                    packageName = attempt.packageName,
+                                    label = attempt.label,
+                                    attempt = attempt.attempt,
+                                    accepted = attempt.accepted,
+                                    reason = attempt.reason,
+                                )
+                            },
+                            // 0 Attempt 的失败（参考加载 / provider 异常）也要留原因
+                            failures = result.failures,
+                        ),
+                    )
+                    refreshGeneration(gid)
                 }
                 _state.value = _state.value.copy(
                     phase = Phase.IDLE,
@@ -477,19 +771,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     statusText = "",
                     hasResult = result.signedApk != null,
                     activeBatchId = null,
-                    batchDetail = batches.read(batchId),
+                    // Done 页的「重新生成」要拿到本次生成的记录
+                    batchDetail = records[generation.id] ?: _state.value.batchDetail,
                 )
                 navigator.resetTo(Route.Pick, Route.Done)
             } catch (e: kotlinx.coroutines.CancellationException) {
-                // 用户取消：保住已生成的图，批次标 CANCELLED 供回看
+                // 用户取消：保住已生成的图，生成标 CANCELLED 供回看
                 withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
-                    persistBatch(BatchStatus.CANCELLED, 0, 0, 0, null, null)
+                    val gid = generationId
+                    if (gid != null) {
+                        val existing = repository.generation(gid)
+                        if (existing != null) {
+                            repository.updateGeneration(
+                                existing.copy(
+                                    status = GenerationStatus.CANCELLED,
+                                    diagnosticsJson = GenerationJsonCodec.encodeDiagnostics(diagnostics.toList()),
+                                ),
+                            )
+                            repository.rebuildIconsFromAttempts(gid)
+                            refreshGeneration(gid)
+                        }
+                    }
                 }
                 throw e
             } catch (e: Exception) {
                 withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
                     diagnostics.add("${e::class.simpleName}: ${e.message?.take(200)}")
-                    persistBatch(BatchStatus.FAILED, 0, 0, 0, null, null)
+                    val gid = generationId
+                    if (gid != null) {
+                        val existing = repository.generation(gid)
+                        if (existing != null) {
+                            repository.updateGeneration(
+                                existing.copy(
+                                    status = GenerationStatus.FAILED,
+                                    diagnosticsJson = GenerationJsonCodec.encodeDiagnostics(diagnostics.toList()),
+                                ),
+                            )
+                            repository.rebuildIconsFromAttempts(gid)
+                            refreshGeneration(gid)
+                        }
+                    }
                 }
                 _state.value = _state.value.copy(
                     phase = Phase.IDLE,
@@ -522,46 +843,149 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------- 批次（历史任务） ----------
+    // ---------- 生成历史 ----------
 
-    /** 重新读取历史批次列表。 */
-    private fun refreshBatches() {
-        val list = batches.list()
-        _state.value = _state.value.copy(batches = list)
+    /** 从 Room 重新加载全部生成历史（含 Attempt），并刷新内存投影缓存。 */
+    private suspend fun reloadRecords() {
+        val list = withContext(Dispatchers.IO) { repository.generationRecords() }
+        records.clear()
+        list.forEach { records[it.id] = it }
+        val current = _state.value
+        _state.value = current.copy(
+            batches = list,
+            batchDetail = current.batchDetail?.id?.let { records[it] } ?: current.batchDetail,
+        )
     }
 
-    /** 打开批次列表页。 */
-    fun openBatches() {
-        refreshBatches()
-        navigator.push(Route.Batches)
+    /** 只刷新一条生成（进度回调高频路径，避免全量重载）。 */
+    private suspend fun refreshGeneration(generationId: String) {
+        val record = withContext(Dispatchers.IO) { repository.generationRecord(generationId) } ?: return
+        records[generationId] = record
+        val current = _state.value
+        val updatedList = if (current.batches.any { it.id == generationId }) {
+            current.batches.map { if (it.id == generationId) record else it }
+        } else {
+            listOf(record) + current.batches
+        }
+        _state.value = current.copy(
+            batches = updatedList,
+            batchDetail = if (current.batchDetail?.id == generationId) record else current.batchDetail,
+        )
     }
 
-    /** 打开某个批次的详情（进度 + 对比）。 */
-    fun openBatch(id: String) {
-        _state.value = _state.value.copy(batchDetail = batches.read(id))
-        navigator.push(Route.BatchDetail(id))
+    // ---------- 项目 / 生成导航（Phase 6） ----------
+
+    /** 打开项目列表页。 */
+    fun openProjects() {
+        navigator.push(Route.Projects)
     }
 
-    fun batchRecord(id: String): BatchRecord? = batches.read(id)
+    /** 打开项目详情：加载对应表条数并订阅其生成历史。 */
+    fun openProject(id: String) {
+        openedProjectId.value = id
+        navigator.push(Route.Project(id))
+        viewModelScope.launch {
+            val count = withContext(Dispatchers.IO) { repository.packEntryCount(id) }
+            _state.value = _state.value.copy(projectPackEntryCount = count)
+        }
+    }
 
-    /** 批次目录里的图/APK 文件（详情页渲染用）。 */
-    fun batchAttemptFile(batchId: String, fileName: String?): File? =
-        batches.attemptFile(batchId, fileName)
+    /** 打开某次生成详情：订阅全部图标，并载入记录（进度 / 对比）。 */
+    fun openGeneration(id: String) {
+        openedGenerationId.value = id
+        iconFilterFlow.value = IconFilter()
+        _state.value = _state.value.copy(iconFilter = IconFilter())
+        navigator.push(Route.Generation(id))
+        viewModelScope.launch {
+            val record = withContext(Dispatchers.IO) { repository.generationRecord(id) }
+            if (record != null) {
+                openedProjectId.value = record.projectId
+                records[id] = record
+                _state.value = _state.value.copy(batchDetail = record)
+            }
+        }
+    }
 
-    fun batchOutputApk(batchId: String, fileName: String?): File? =
-        batches.outputApk(batchId, fileName)
+    /** 生成详情页：切换包名筛选（同时重置组件筛选）。 */
+    fun setIconPackageFilter(packageName: String?) {
+        iconFilterFlow.value = iconFilterFlow.value.copy(
+            packageName = packageName,
+            activityName = null,
+        )
+        _state.value = _state.value.copy(iconFilter = iconFilterFlow.value)
+    }
 
-    /** 删除批次记录。 */
+    /** 生成详情页：切换组件筛选。 */
+    fun setIconActivityFilter(activityName: String?) {
+        iconFilterFlow.value = iconFilterFlow.value.copy(activityName = activityName)
+        _state.value = _state.value.copy(iconFilter = iconFilterFlow.value)
+    }
+
+    /** 生成详情页：切换 accepted 筛选（null=全部）。 */
+    fun setIconAcceptedFilter(accepted: Boolean?) {
+        iconFilterFlow.value = iconFilterFlow.value.copy(accepted = accepted)
+        _state.value = _state.value.copy(iconFilter = iconFilterFlow.value)
+    }
+
+    /** 打开同一目标跨生成对比。 */
+    fun openCompare(projectId: String, packageName: String, activityName: String?) {
+        compareKeyFlow.value = CompareKey(projectId, packageName, activityName)
+        navigator.push(Route.Compare(projectId, packageName, activityName))
+    }
+
+    /** 对比页每行懒加载某次生成产出的图（取该目标最新一次请求的 PNG）。 */
+    suspend fun compareTargetIcon(projectId: String, match: GenerationIconMatch): ByteArray? =
+        withContext(Dispatchers.IO) {
+            val attempts = repository.attempts(match.icon.generationId)
+                .filter { it.packageName == match.icon.packageName }
+            val chosen = attempts.lastOrNull { it.accepted } ?: attempts.lastOrNull()
+            chosen?.pngFile
+                ?.let { repository.attemptFile(projectId, match.icon.generationId, it) }
+                ?.readBytes()
+        }
+
+    /** 用户手动把项目当前指向设为某次生成（null=清除）。 */
+    fun setActiveGeneration(projectId: String, generationId: String?) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { repository.setActiveGeneration(projectId, generationId) }
+        }
+    }
+
+    /** 删除项目及其全部生成（磁盘目录一并清理）。 */
+    fun deleteProject(id: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { repository.deleteProject(id) }
+            if (openedProjectId.value == id) openedProjectId.value = null
+        }
+    }
+
+    fun batchRecord(id: String): GenerationRecord? = records[id]
+
+    /** 生成目录里的图/APK 文件（详情页渲染用）。 */
+    fun batchAttemptFile(batchId: String, fileName: String?): File? {
+        val record = records[batchId] ?: return null
+        return repository.attemptFile(record.projectId, batchId, fileName)
+    }
+
+    fun batchOutputApk(batchId: String, fileName: String?): File? {
+        val record = records[batchId] ?: return null
+        return repository.outputApk(record.projectId, batchId, fileName)
+    }
+
+    /** 删除一条生成记录。 */
     fun deleteBatch(id: String) {
-        batches.delete(id)
         if (_state.value.batchDetail?.id == id) {
             _state.value = _state.value.copy(batchDetail = null)
         }
-        refreshBatches()
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { repository.deleteGeneration(id) }
+            records.remove(id)
+            reloadRecords()
+        }
     }
 
     /**
-     * 对批次里的一次生成重新发起请求（「生成详情」弹窗的「重新生成」）。
+     * 对生成里的一次请求重新发起（「生成详情」弹窗的「重新生成」）。
      *
      * @param referencesOverride 「重新取样」当下敲定的参考；null=沿用原请求的参考
      * @param slotId 指定模型（槽位 id）；null 表示沿用原请求的槽位
@@ -576,7 +1000,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         slotId: String? = null,
     ) {
         if (_state.value.regenerating != null) return
-        val record = batches.read(batchId) ?: return
+        val record = records[batchId] ?: return
         val source = record.attempts.firstOrNull {
             it.packageName == packageName && it.attempt == attempt
         } ?: return
@@ -615,17 +1039,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     runRegeneration(record, source, references, config, provenance)
                 }
                 val persisted = withContext(Dispatchers.IO) {
-                    val record2 = batches.persistAttempt(batchId, result)
-                    val latest = batches.read(batchId) ?: record
-                    batches.save(latest.copy(attempts = latest.attempts + record2))
-                    record2
+                    val entity = repository.persistAttempt(record.projectId, batchId, result)
+                    // 重新生成可能改变该目标图标行的通过状态，保持筛选结果一致
+                    repository.refreshIconOutcome(batchId, result.packageName)
+                    refreshGeneration(batchId)
+                    entity
                 }
                 _state.value = _state.value.copy(
                     regenerating = null,
-                    batchDetail = batches.read(batchId),
-                    batches = batches.list(),
                     // Done 页列表用的是内存 attempt：同批次的重新请求实时补进去
-                    attempts = if (sessionBatchId == batchId) {
+                    attempts = if (sessionGenerationId == batchId) {
                         _state.value.attempts + buildsAttempt(batchId, persisted)
                     } else {
                         _state.value.attempts
@@ -652,7 +1075,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         snapshots: List<ReferenceSnapshot>,
     ): List<ReferenceIconPair> = withContext(Dispatchers.IO) {
         if (snapshots.isEmpty()) return@withContext emptyList()
-        val record = batches.read(batchId) ?: return@withContext emptyList()
+        val record = records[batchId] ?: return@withContext emptyList()
         val pack = openPackForRegenerate(record) ?: return@withContext emptyList()
         pack.use {
             snapshots.map { snap ->
@@ -674,7 +1097,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * 「重新取样」的一次刷新：从参考池随机抽 [count] 组并渲染采样图。
      *
-     * 全程本地、不发起 provider 请求；池子按「批次 + 目标」缓存在内存，
+     * 全程本地、不发起 provider 请求；池子按「生成 + 目标」缓存在内存，
      * 后续刷新只重渲染抽中的几组（弹窗里的「不断替换」靠它保持轻量）。
      */
     suspend fun sampleReferences(
@@ -682,7 +1105,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         packageName: String,
         count: Int,
     ): SampledReferences? = withContext(Dispatchers.IO) {
-        val record = batches.read(batchId) ?: return@withContext null
+        val record = records[batchId] ?: return@withContext null
         val context = getApplication<Application>()
         val key = "$batchId/$packageName"
         val pool = shufflePool?.takeIf { it.key == key }?.pairs ?: run {
@@ -782,6 +1205,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     private fun openSamplePack(context: Application): IconPackSource? {
         val state = _state.value
+        // 项目快照优先：源包卸载/更新后，确认页与设置页的示例图仍可渲染
+        state.snapshotProjectId?.let { projectId ->
+            repository.sourceApk(projectId)?.let { snapshot ->
+                IconPackSource.open(context, snapshot)?.let { return it }
+            }
+        }
         state.selectedPack?.let { info ->
             IconPackSource.open(context, info.packageName)?.let { return it }
         }
@@ -984,32 +1413,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** 把落盘的 attempt 转回内存对象（Done 页预览用）。 */
-    private fun buildsAttempt(
-        batchId: String,
-        record: dev.artplus.iconpackfiller.batch.AttemptRecord,
-    ): GenerationAttempt = GenerationAttempt(
-        packageName = record.packageName,
-        label = record.label,
-        attempt = record.attempt,
-        accepted = record.accepted,
-        reason = record.reason,
-        pngBytes = record.pngFile?.let { batches.attemptFile(batchId, it)?.readBytes() } ?: ByteArray(0),
-        references = record.references,
-        sourcePngBytes = record.sourceFile?.let { batches.attemptFile(batchId, it)?.readBytes() },
-        provenance = GenerationProvenance(
-            model = record.model,
-            slotId = record.slotId,
-            slotName = record.slotName,
-        ),
-        prompt = record.prompt,
-        referenceDetails = record.referenceDetails,
-    )
+    /** 把落库的 attempt 转回内存对象（Done 页预览用）。 */
+    private fun buildsAttempt(generationId: String, record: AttemptEntity): GenerationAttempt {
+        val projectId = records[generationId]?.projectId
+        return GenerationAttempt(
+            packageName = record.packageName,
+            label = record.label,
+            attempt = record.attempt,
+            accepted = record.accepted,
+            reason = record.reason,
+            pngBytes = record.pngFile
+                ?.let { projectId?.let { pid -> repository.attemptFile(pid, generationId, it) } }
+                ?.readBytes() ?: ByteArray(0),
+            references = GenerationJsonCodec.decodeReferences(record.referencesJson),
+            sourcePngBytes = record.sourceFile
+                ?.let { projectId?.let { pid -> repository.attemptFile(pid, generationId, it) } }
+                ?.readBytes(),
+            provenance = GenerationProvenance(
+                model = record.model,
+                slotId = record.slotId,
+                slotName = record.slotName,
+            ),
+            prompt = record.prompt,
+            referenceDetails = GenerationJsonCodec.decodeReferenceDetails(record.referenceDetailsJson),
+        )
+    }
 
     /** IO 线程执行：打开图标包 → 组装参考 → 调单图标生成管线。 */
     private suspend fun runRegeneration(
-        record: BatchRecord,
-        source: dev.artplus.iconpackfiller.batch.AttemptRecord,
+        record: GenerationRecord,
+        source: AttemptRecord,
         references: List<ReferenceSnapshot>,
         config: dev.artplus.iconpackfiller.provider.ProviderConfig,
         provenance: GenerationProvenance,
@@ -1034,18 +1467,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 callLimit = settings.callLimit.takeIf { it > 0 },
                 requestTransparentBackground = TransparencyPresets.effective(config.model, config.transparency),
             )
-            // 批次内的序号接着原记录排（列表 key 依赖 pkg+attempt 唯一）
+            // 生成内的序号接着原记录排（列表 key 依赖 pkg+attempt 唯一）
             val next = (record.attempts.filter { it.packageName == source.packageName }
                 .maxOfOrNull { it.attempt } ?: 0) + 1
             return attempt.copy(attempt = next)
         }
     }
 
-    /** 重新请求用的图标包：已安装优先；导入的 APK 用缓存副本（包名需匹配）。 */
-    private fun openPackForRegenerate(record: BatchRecord): IconPackSource? {
+    /**
+     * 重新请求用的图标包：已安装优先；其次项目目录内的 `source.apk` 快照
+     * （源包卸载/更新后仍可重新请求）；最后退回导入 APK 的缓存副本（包名需匹配）。
+     */
+    private fun openPackForRegenerate(record: GenerationRecord): IconPackSource? {
         val context = getApplication<Application>()
         if (record.packPackage.isNotEmpty()) {
             IconPackSource.open(context, record.packPackage)?.let { return it }
+        }
+        repository.sourceApk(record.projectId)?.let { snapshot ->
+            IconPackSource.open(context, snapshot)?.let { return it }
         }
         val cached = File(context.cacheDir, "source-iconpack.apk")
         if (!cached.exists()) return null
@@ -1055,14 +1494,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return null
     }
 
-    /** 把历史批次设为当前导出对象（详情页「导出 APK」用）。 */
+    /** 把历史生成设为当前导出对象（详情页「导出 APK」用）。 */
     fun exportBatch(batchId: String): File? {
-        val record = batches.read(batchId) ?: return null
-        return batches.outputApk(batchId, record.outputApk)
+        val record = records[batchId] ?: return null
+        return repository.outputApk(record.projectId, batchId, record.outputApk)
     }
 
     fun batchFileName(batchId: String): String {
-        val record = batches.read(batchId) ?: return "iconpack_filler.apk"
+        val record = records[batchId] ?: return "iconpack_filler.apk"
         return record.outputApkName ?: "iconpack_filler.apk"
     }
 
@@ -1088,7 +1527,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun clearSession() {
         session = null
-        sessionBatchId = null
+        sessionGenerationId = null
         shufflePool = null
         clearBatchReferences()
         _state.value = _state.value.copy(
@@ -1136,6 +1575,47 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 current.copy(error = "${progress.stage}: ${progress.message}")
         }
     }
+
+    private data class SourceMeta(
+        val packageName: String,
+        val versionCode: Int,
+        val hash: String,
+        val apkFile: File,
+    )
+
+    /** 打开已解析的图标包来源解析源元数据（包名/版本/内容哈希/源 APK 文件），用于建项目与快照。 */
+    private fun openSourceMeta(
+        context: Application,
+        resolved: GenerationSourceResolver.Resolved,
+    ): SourceMeta? {
+        val pack = when {
+            resolved.installedPackage != null -> IconPackSource.open(context, resolved.installedPackage)
+            resolved.apkFile != null -> IconPackSource.open(context, resolved.apkFile)
+            else -> null
+        } ?: return null
+        return pack.use {
+            val apk = it.sourceApk
+            SourceMeta(
+                packageName = it.packageName,
+                versionCode = it.versionCode,
+                hash = sha256(apk),
+                apkFile = apk,
+            )
+        }
+    }
+
+    private fun sha256(file: File): String = runCatching {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(8192)
+            while (true) {
+                val read = input.read(buffer)
+                if (read <= 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        digest.digest().joinToString("") { "%02x".format(it) }
+    }.getOrDefault("")
 
     private suspend fun copyApkToCache(uri: Uri?): File? {
         if (uri == null) return null

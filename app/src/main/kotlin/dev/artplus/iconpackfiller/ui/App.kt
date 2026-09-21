@@ -19,11 +19,13 @@ import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberSaveableStateHolderNavEntryDecorator
 import androidx.navigation3.ui.NavDisplay
 import dev.artplus.iconpackfiller.ui.navigation.Route
-import dev.artplus.iconpackfiller.ui.screen.BatchDetailScreen
-import dev.artplus.iconpackfiller.ui.screen.BatchesScreen
+import dev.artplus.iconpackfiller.ui.screen.CompareScreen
 import dev.artplus.iconpackfiller.ui.screen.DoneScreen
+import dev.artplus.iconpackfiller.ui.screen.GenerationScreen
 import dev.artplus.iconpackfiller.ui.screen.PickScreen
 import dev.artplus.iconpackfiller.ui.screen.ProgressScreen
+import dev.artplus.iconpackfiller.ui.screen.ProjectScreen
+import dev.artplus.iconpackfiller.ui.screen.ProjectsScreen
 import dev.artplus.iconpackfiller.ui.screen.ReviewScreen
 import dev.artplus.iconpackfiller.ui.screen.SettingsScreen
 import dev.artplus.iconpackfiller.ui.theme.ColorMode
@@ -68,7 +70,7 @@ fun App(
                     state = state,
                     viewModel = viewModel,
                     onOpenSettings = { viewModel.navigator.push(Route.Settings) },
-                    onOpenBatches = { viewModel.openBatches() },
+                    onOpenProjects = { viewModel.openProjects() },
                 )
             }
             entry<Route.Review> {
@@ -93,18 +95,36 @@ fun App(
                     onBack = { viewModel.navigator.pop() },
                 )
             }
-            entry<Route.Batches> {
-                BatchesScreen(
+            entry<Route.Projects> {
+                ProjectsScreen(
                     state = state,
                     viewModel = viewModel,
                     onBack = { viewModel.navigator.pop() },
                 )
             }
-            entry<Route.BatchDetail> { key ->
-                BatchDetailScreen(
+            entry<Route.Project> { key ->
+                ProjectScreen(
                     state = state,
                     viewModel = viewModel,
-                    batchId = key.id,
+                    projectId = key.id,
+                    onBack = { viewModel.navigator.pop() },
+                )
+            }
+            entry<Route.Generation> { key ->
+                GenerationScreen(
+                    state = state,
+                    viewModel = viewModel,
+                    generationId = key.id,
+                    onBack = { viewModel.navigator.pop() },
+                )
+            }
+            entry<Route.Compare> { key ->
+                CompareScreen(
+                    state = state,
+                    viewModel = viewModel,
+                    projectId = key.projectId,
+                    packageName = key.packageName,
+                    activityName = key.activityName,
                     onBack = { viewModel.navigator.pop() },
                 )
             }

@@ -33,13 +33,15 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme.colorScheme
 
 /**
  * 步骤 1：选择图标包（已安装列表 / 导入 APK）。
+ *
+ * 「导入或选定图标包即建项目」：选定后异步建项，顶部给出「已创建项目」入口。
  */
 @Composable
 fun PickScreen(
     state: UiState,
     viewModel: MainViewModel,
     onOpenSettings: () -> Unit,
-    onOpenBatches: () -> Unit,
+    onOpenProjects: () -> Unit,
 ) {
     val apkPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) viewModel.selectApk(uri, uri.lastPathSegment)
@@ -48,11 +50,11 @@ fun PickScreen(
     MiuixScreen(
         title = "图标包补全器",
         navigationIcon = {
-            // 历史任务入口固定在左上角（环形箭头 + 表针的历史图标）
-            IconButton(onClick = onOpenBatches) {
+            // 项目入口固定在左上角（环形箭头 + 表针的历史图标）
+            IconButton(onClick = onOpenProjects) {
                 Icon(
                     imageVector = MiuixIcons.History,
-                    contentDescription = "历史任务",
+                    contentDescription = "项目",
                     tint = colorScheme.onSurface,
                     modifier = Modifier.size(24.dp),
                 )
@@ -93,18 +95,35 @@ fun PickScreen(
             }
         }
 
-        if (state.batches.isNotEmpty()) {
-            item(key = "batches") {
+        if (state.selectedProjectId != null) {
+            item(key = "project") {
                 Card(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(bottom = 8.dp),
-                    onClick = onOpenBatches,
+                    onClick = { viewModel.openProject(state.selectedProjectId) },
                     showIndication = true,
                 ) {
                     BasicComponent(
-                        title = "历史任务",
-                        summary = "共 ${state.batches.size} 个 · 查看进度与生成对比",
+                        title = "已创建项目",
+                        summary = "${state.selectedPack?.label ?: state.selectedApkName ?: "图标包"} · 点击查看对应表与生成历史",
+                    )
+                }
+            }
+        }
+
+        if (state.projects.isNotEmpty()) {
+            item(key = "projects") {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 8.dp),
+                    onClick = onOpenProjects,
+                    showIndication = true,
+                ) {
+                    BasicComponent(
+                        title = "项目",
+                        summary = "共 ${state.projects.size} 个 · 查看生成历史与跨生成对比",
                     )
                 }
             }

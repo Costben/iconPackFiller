@@ -9,6 +9,8 @@ import dev.artplus.iconpackfiller.pack.ApkDrawableRenderer
 import dev.artplus.iconpackfiller.pack.AppFilterDocument
 import dev.artplus.iconpackfiller.pack.AppFilterParser
 import dev.artplus.iconpackfiller.pack.InstalledIconPack
+import dev.artplus.iconpackfiller.pack.PackResourceFile
+import dev.artplus.iconpackfiller.pack.bestResourcePath
 import java.io.File
 
 /**
@@ -23,6 +25,12 @@ sealed interface IconPackSource : AutoCloseable {
     val sourceApk: File
     val document: AppFilterDocument
     val availableDrawables: Set<String>
+
+    /** 包内全部候选图标资源文件（含未被 appfilter 引用的）。 */
+    val resources: List<PackResourceFile>
+
+    /** drawable 名 -> 最佳（最高密度）包内资源路径；不存在返回 null。 */
+    fun resourcePath(drawableName: String): String? = resources.bestResourcePath(drawableName)
 
     fun renderDrawable(drawableName: String): Bitmap?
 
@@ -88,10 +96,26 @@ private class InstalledSource(
     override val availableDrawables: Set<String>,
     override val versionCode: Int,
 ) : IconPackSource {
+
+    /** 已安装包的资源枚举：直接读源 APK 的 zip 目录；失败退回空表。 */
+    private val filePackLazy = lazy {
+        runCatching { ApkFileIconPack.open(pack.sourceApk()) }.getOrNull()
+    }
+
+    private val filePack: ApkFileIconPack? get() = filePackLazy.value
+
     override val packageName: String get() = pack.packageName
     override val sourceApk: File get() = pack.sourceApk()
+    override val resources: List<PackResourceFile> get() = filePack?.resourceFiles.orEmpty()
+    override fun resourcePath(drawableName: String): String? =
+        filePack?.resourceFiles?.bestResourcePath(drawableName)
+
     override fun renderDrawable(drawableName: String): Bitmap? = pack.renderDrawable(drawableName)
-    override fun close() = Unit
+
+    override fun close() {
+        // 只关真正打开过的枚举句柄，避免 close 时反向触发一次无谓的 APK 打开。
+        if (filePackLazy.isInitialized()) filePackLazy.value?.close()
+    }
 }
 
 private class ApkSource(
@@ -104,12 +128,30 @@ private class ApkSource(
     override val versionCode: Int,
 ) : IconPackSource {
     override val sourceApk: File get() = apkFile
+    override val resources: List<PackResourceFile> get() = pack.resourceFiles
+
     override fun renderDrawable(drawableName: String): Bitmap? {
-        val bytes = pack.readDrawableBytes(drawableName)
+        // ARSCLib 读 zip 条目可能抛 IOException；快照路径若让它冒泡，
+        // 上层（参考图加载）会被静默吞掉并表现为「0 图标、无原因」。
+        // 这里折成 null 后退到平台 Resources 渲染，行为与已安装来源对齐。
+        val bytes = runCatching { pack.readDrawableBytes(drawableName) }.getOrNull()
         if (bytes != null) {
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            if (decoded != null) return decoded.normalizedForReference()
         }
         return renderer?.renderDrawable(drawableName)
+    }
+
+    /**
+     * 统一到与已安装来源（[InstalledIconPack.renderDrawable] 固定 [InstalledIconPack.DEFAULT_SIZE]）
+     * 相同的边长，避免同一图标包因来源不同而给模型不同分辨率的参考图。
+     */
+    private fun Bitmap.normalizedForReference(): Bitmap {
+        val size = InstalledIconPack.DEFAULT_SIZE
+        if (width == size && height == size) return this
+        val scaled = Bitmap.createScaledBitmap(this, size, size, true)
+        if (scaled !== this) recycle()
+        return scaled
     }
 
     override fun close() {

@@ -11,7 +11,10 @@ import dev.artplus.iconpackfiller.coverage.LaunchableApp
 object TargetSelection {
 
     /** 单个可生成目标的稳定 key：`package/activity`。 */
-    fun keyOf(app: LaunchableApp): String = "${app.packageName}/${app.activityName}"
+    fun keyOf(app: LaunchableApp): String = keyOf(app.packageName, app.activityName)
+
+    /** 与 [keyOf] 同格式；供只有包名/组件名（无 [LaunchableApp]）的调用方复用。 */
+    fun keyOf(packageName: String, activityName: String): String = "$packageName/$activityName"
 
     /**
      * 按选中集合过滤 [apps]，保持原顺序。
