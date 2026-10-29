@@ -1,3 +1,5 @@
+<img src="favicon.png" width="96" height="96" alt="IconPackFiller" />
+
 # IconPackFiller
 
 [![CI](https://github.com/Costben/iconPackFiller/actions/workflows/android-ci.yml/badge.svg)](https://github.com/Costben/iconPackFiller/actions/workflows/android-ci.yml)
